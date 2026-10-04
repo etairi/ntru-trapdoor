@@ -152,8 +152,6 @@ licence texts.
   the 31-bit NTT, and the structure of key generation.
 - **[falcon-rust](https://github.com/aszepieniec/falcon-rust)** by Alan Szepieniec (MIT), v0.3.1:
   the structure of the big-integer NTRUSolve and of its Babai reduction.
-- **[Jali](https://github.com/etairi/jali)** (MIT, same author as this crate): the
-  interval-certified half-Gaussian table generator, ported as `tools/gauss_tables.py`.
 
 ## References
 
