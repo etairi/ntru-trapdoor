@@ -14,6 +14,11 @@ repository = "https://github.com/etairi/ntru-trapdoor"
 # Not on crates.io yet; used as a git dependency.
 publish = false
 
+# docs.rs (and `cargo docs`, see .cargo/config.toml): load KaTeX so that the formulas of the API
+# documentation render.
+[package.metadata.docs.rs]
+rustdoc-args = ["--html-in-header", "docs/katex-header.html"]
+
 [lib]
 name = "ntru_trapdoor"
 

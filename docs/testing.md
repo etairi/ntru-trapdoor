@@ -7,6 +7,7 @@ cargo build
 cargo test                                         # statistical tests run optimised (opt-level 3)
 cargo test --release -- --include-ignored          # everything, with the long statistical runs
 cargo clippy --all-targets -- -D warnings
+cargo docs                                         # API documentation with rendered formulas (KaTeX)
 cargo bench                                        # criterion: benches/{sign,keygen,e2e}.rs
 python3 tools/gauss_tables.py --check              # src/tables.rs against its definition (mpmath)
 ```

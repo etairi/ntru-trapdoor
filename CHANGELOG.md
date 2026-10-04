@@ -104,6 +104,10 @@ crate were never released; the label `ntru-trapdoor/v1/samp-pre` denotes this ve
 
 ### Documentation
 
+- (2026-10-04) The API documentation renders its formulas: `docs/katex-header.html` (KaTeX 0.17.0
+  from jsDelivr with SRI hashes, the header of the PCS and Jali crates) is passed to rustdoc by the
+  `cargo docs` alias and by `[package.metadata.docs.rs]`. All 903 inline formulas of `src/` parse
+  with KaTeX 0.17.0.
 - (2026-10-04) Security notes: a key-distribution section. Every accepted key has
   `vol(R·(g, −f))^(1/d)/√q` in `[1/1.17, 1.17]` (proved: the lower end by Pataki–Tural, or by
   AM–GM on the second norm test; the upper end by AM–GM and the first test), so the key's lattice

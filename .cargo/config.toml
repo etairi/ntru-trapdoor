@@ -1,0 +1,4 @@
+[alias]
+# `cargo docs`: the API documentation with its formulas rendered by KaTeX (docs/katex-header.html),
+# as on docs.rs. A plain `cargo doc` works too and shows the formulas as LaTeX source.
+docs = ["rustdoc", "--lib", "--", "--html-in-header", "docs/katex-header.html"]
