@@ -104,6 +104,12 @@ Widths follow Falcon's convention, the standard deviation `σ`. Papers in the GP
 the width parameter `ς`, with `σ = ς/√(2π)`. `Params::FALCON_1024` has fn-dsa's constants bit for
 bit and exists for the parity tests.
 
+A custom set may tighten Falcon's Gram–Schmidt bound `(1.17 √q)²`, but `Params::validate` refuses
+to loosen it. With the bound, every accepted key has `vol(R·(g, −f))^(1/d)` within a factor 1.17 of
+`√q`, whatever the modulus, so the key's lattice has none of the unusually dense sublattices that
+overstretched NTRU attacks exploit. The [security notes](docs/security.md) give the proof, the
+measurements and the estimates.
+
 ## Performance
 
 Indicative medians on an Apple M4, one thread, rustc 1.99.0, release profile, with other
@@ -126,7 +132,8 @@ set.
 
 - [Distribution and precision](docs/precision.md): what is exact, what was measured, and a
   Rényi-divergence budget.
-- [Security notes](docs/security.md): randomness, side channels and wiping.
+- [Security notes](docs/security.md): randomness, the key distribution (overstretched NTRU),
+  side channels and wiping.
 - [Testing and benchmarks](docs/testing.md).
 - [Changelog](CHANGELOG.md).
 

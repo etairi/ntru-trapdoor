@@ -8,12 +8,14 @@
 //! - H-4 (stats F1): SamplerZ rejects a far-tail trial that fn-dsa's saturated BerExp would
 //!   accept with probability 2^-64;
 //! - H-5 (review 1.8): the attempt cap, the redacted `Debug` output, the prepared `h`, and
-//!   Verify on `s = 0`.
+//!   Verify on `s = 0`;
+//! - H-6 (overstretched-NTRU check, 2026-10-04): `Params::validate` refuses a Gram–Schmidt bound
+//!   above `(1.17 sqrt q)^2`, which would let small `f, g` through at a large `q`.
 
 use ntru_trapdoor::hazmat::{LeafSampler, Prng, SamplerZ};
 use ntru_trapdoor::{
-    BaseSampler, Error, ExpandedKey, Params, Preimage, PublicKey, RqPoly, SecretKey, samp_pre,
-    trapgen, verify,
+    BaseSampler, Error, ExpandedKey, KeygenReject, Params, Preimage, PublicKey, RqPoly, SecretKey,
+    samp_pre, trapgen, trapgen_from_fg, verify,
 };
 use zeroize::Zeroize;
 
@@ -169,6 +171,85 @@ fn leaf_windows() {
         p.check_leaf_window(),
         Err(Error::InvalidParams(_))
     ));
+}
+
+/// H-6: the Gram–Schmidt bound is at most `(1.17 sqrt q)^2 = 13689 q / 10000`. A looser bound
+/// would let key generation accept small `f, g`, i.e. overstretched NTRU instances at a large `q`
+/// (docs/security.md, "Key distribution").
+#[test]
+fn looser_gram_schmidt_bounds_are_refused() {
+    for p in [Params::PCS, Params::FALCON_1024] {
+        // The presets sit exactly on the bound.
+        assert_eq!(
+            10_000 * p.gs_bound_num,
+            13_689 * u64::from(p.q) * p.gs_bound_den,
+            "{}",
+            p.name
+        );
+        p.validate().unwrap();
+        // One unit above: refused by validate and by every entry point that validates.
+        let loose = Params {
+            gs_bound_num: p.gs_bound_num + 1,
+            ..p
+        };
+        assert!(
+            matches!(loose.validate(), Err(Error::InvalidParams(_))),
+            "{}",
+            p.name
+        );
+        assert!(matches!(
+            trapgen(&loose, &[0; 32]),
+            Err(Error::InvalidParams(_))
+        ));
+        assert!(matches!(
+            PublicKey::from_bytes(&loose, &vec![0; loose.rq_bytes()]),
+            Err(Error::InvalidParams(_))
+        ));
+        assert!(matches!(
+            SecretKey::from_parts(
+                &loose,
+                vec![0; loose.n()],
+                vec![0; loose.n()],
+                vec![0; loose.n()],
+                vec![0; loose.n()]
+            ),
+            Err(Error::InvalidParams(_))
+        ));
+        assert!(matches!(
+            SecretKey::from_bytes(&loose, &[0; 8]),
+            Err(Error::InvalidParams(_))
+        ));
+        let h = RqPoly::from_coeffs(&loose, &vec![1; loose.n()]).unwrap();
+        assert!(matches!(
+            PublicKey::from_h(&loose, h),
+            Err(Error::InvalidParams(_))
+        ));
+        assert!(matches!(
+            trapgen_from_fg(&loose, &vec![1; loose.n()], &vec![1; loose.n()]),
+            Err(KeygenReject::Input)
+        ));
+        // The same ratio over another denominator is the same bound; a tighter one is accepted.
+        Params {
+            gs_bound_num: 2 * p.gs_bound_num,
+            gs_bound_den: 2 * p.gs_bound_den,
+            ..p
+        }
+        .validate()
+        .unwrap();
+        Params {
+            gs_bound_num: p.gs_bound_num - 1,
+            ..p
+        }
+        .validate()
+        .unwrap();
+    }
+    // A bound of 2q: refused.
+    let p = Params {
+        gs_bound_num: 2 * u64::from(Params::PCS.q),
+        gs_bound_den: 1,
+        ..Params::PCS
+    };
+    assert!(matches!(p.validate(), Err(Error::InvalidParams(_))));
 }
 
 /// Replays fixed bytes.

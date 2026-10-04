@@ -122,7 +122,8 @@ pub struct Params {
     pub sigma_fg: f64,
     /// The 128-bit half-Gaussian reverse CDT of width $`\sigma_{fg}`$ (see [`crate::tables`]).
     pub fg_table: &'static [u128],
-    /// Numerator of the Gram–Schmidt bound $`(1.17\sqrt q)^2=13689\,q/10000`$.
+    /// Numerator of the Gram–Schmidt bound $`(1.17\sqrt q)^2=13689\,q/10000`$; a custom set
+    /// may make the bound smaller, never larger ([`Params::validate`]).
     pub gs_bound_num: u64,
     /// Denominator of the Gram–Schmidt bound (10000).
     pub gs_bound_den: u64,
@@ -245,7 +246,15 @@ impl Params {
         Ok(())
     }
 
-    /// Structural checks of a parameter set (not of its security). Key generation also requires
+    /// Structural checks of a parameter set, and one security floor: the Gram–Schmidt bound must
+    /// be at most Falcon's $`(1.17\sqrt q)^2=13689\,q/10000`$ (exact integer comparison). Under
+    /// that bound, every key that key generation accepts is a trapdoor basis with Gram–Schmidt
+    /// norms at most $`1.17\sqrt q`$ (up to the `f64` evaluation of the second norm, relative
+    /// error about $`2^{-43}`$), so every rank-$`d`$ sublattice of the lattice
+    /// $`\{(s_0,s_1):s_0+hs_1=0\bmod q\}`$ has volume at least $`(\sqrt q/1.17)^d`$: none is
+    /// denser, per dimension, than the lattice itself by more than a factor 1.17, unlike the
+    /// sublattice $`R\cdot(g,-f)`$ that overstretched NTRU attacks exploit (docs/security.md, "Key
+    /// distribution"). Tighter bounds are accepted. Key generation also requires
     /// [`Params::check_leaf_window`].
     pub fn validate(&self) -> Result<(), Error> {
         self.check_ring()?;
@@ -285,6 +294,14 @@ impl Params {
         if !positive(self.sigma_fg) || self.gs_bound_num == 0 || self.gs_bound_den == 0 {
             return Err(Error::InvalidParams(
                 "sigma_fg and the GS bound must be positive",
+            ));
+        }
+        // gs_bound_num / gs_bound_den <= 13689 q / 10000, in u128 (both sides below 2^103).
+        if u128::from(self.gs_bound_num) * 10_000
+            > 13_689 * u128::from(self.q) * u128::from(self.gs_bound_den)
+        {
+            return Err(Error::InvalidParams(
+                "the GS bound must be at most (1.17 sqrt q)^2 = 13689 q / 10000",
             ));
         }
         if !(2..=16).contains(&self.sk_fg_bits) || !(2..=16).contains(&self.sk_big_fg_bits) {
