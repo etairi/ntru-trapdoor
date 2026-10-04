@@ -137,6 +137,10 @@ set.
 - [Testing and benchmarks](docs/testing.md).
 - [Changelog](CHANGELOG.md).
 
+The API documentation writes its formulas as KaTeX, inside code (`` $`…`$ ``). `cargo doc` leaves
+them readable as LaTeX; `cargo docs` builds the documentation with the KaTeX header in
+`docs/katex-header.html`, as docs.rs does, so that they render (KaTeX is loaded from a CDN).
+
 ## Credits
 
 This crate ports code from the following works. [`NOTICE`](NOTICE) gives the details and the
