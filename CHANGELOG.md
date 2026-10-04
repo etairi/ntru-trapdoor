@@ -16,8 +16,8 @@ and precision, security, testing and benchmarks). The analysis scripts behind th
 `examples/quickstart.rs` runs the README's example.
 
 The entries below record what changed after the adversarial review and the statistics study of
-2026-10-03. Earlier states of the crate were never released; the label `ntru-trapdoor/v1/samp-pre`
-denotes this version.
+2026-10-03, and after the overstretched-NTRU check of 2026-10-04 (marked). Earlier states of the
+crate were never released; the label `ntru-trapdoor/v1/samp-pre` denotes this version.
 
 ### Fixed
 
@@ -44,6 +44,11 @@ denotes this version.
 
 ### Changed
 
+- **`Params::validate` refuses a Gram–Schmidt bound above `(1.17 √q)² = 13689 q / 10000`**
+  (2026-10-04). The second norm test, not `σ_fg`, is what rules out the dense sublattice that
+  overstretched NTRU attacks exploit: with the bound, `vol(R·(g, −f))^(1/d)` lies within a factor
+  1.17 of `√q` (security notes, "Key distribution"). A custom set may tighten the bound but no
+  longer loosen it. Both presets sit exactly on the bound; no output changes.
 - **The width-3.1 base table is rounded at 192 bits** (stats finding F2, medium): `BASE_3_1_192`,
   the same 41 rows as before, each rounded at 192 instead of 128 bits. The last row's relative
   error falls from +24% to 1.4% (the cut tail), and the sampler's own Rényi term per call from
@@ -92,9 +97,20 @@ denotes this version.
   equation against the big-integer oracle; the far tail of `ber_exp`; prepared products; inverses
   for composite moduli; the rounding guard; Verify against the plain formula.
 - `CHANGELOG.md`.
+- (2026-10-04) `examples/stats_density.rs` (the density of `R·(g, −f)` over generated keys, by a
+  direct DFT) and `tools/stats/ntru_fatigue.py` (Ducas and van Woerden's estimator, read from a
+  checkout of their code), behind the key-distribution section of the security notes; the
+  regression test H-6 in `tests/hardening.rs`.
 
 ### Documentation
 
+- (2026-10-04) Security notes: a key-distribution section. Every accepted key has
+  `vol(R·(g, −f))^(1/d)/√q` in `[1/1.17, 1.17]` (proved: the lower end by Pataki–Tural, or by
+  AM–GM on the second norm test; the upper end by AM–GM and the first test), so the key's lattice
+  lacks the unusually dense sublattice that overstretched NTRU attacks exploit, although the PCS
+  modulus is above the ternary fatigue point. With measurements on 2000 keys and the authors'
+  estimator (heuristic: expected block size 948, the same as for Falcon-1024 keys, and no
+  dense-sublattice event above its 10^-7 threshold). README: a note on the bound.
 - README: performance table, precision and distribution evidence with the Rényi budget per number
   of calls, the leaf-range proposition, and the limitations.
 - Corrected statements: output parity with fn-dsa certifies decisions and constants (to about
