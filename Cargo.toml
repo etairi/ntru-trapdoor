@@ -1,0 +1,64 @@
+[package]
+name = "ntru-trapdoor"
+version = "0.1.0"
+edition = "2024"
+# The MSRV of the PCS, Jali and the OpenVTC workspace, the intended consumers.
+rust-version = "1.95"
+license = "MIT"
+authors = ["Erkan Tairi"]
+description = "NTRU lattice trapdoors (DLP14/Falcon convention): TrapGen, Falcon-style fast-Fourier preimage sampling at arbitrary targets, and exact arithmetic in Z_q[x]/(x^d+1) for any prime q, including q = 5 mod 8"
+readme = "README.md"
+keywords = ["lattice", "ntru", "trapdoor", "falcon", "post-quantum"]
+categories = ["cryptography"]
+repository = "https://github.com/etairi/ntru-trapdoor"
+# Not on crates.io yet; used as a git dependency.
+publish = false
+
+[lib]
+name = "ntru_trapdoor"
+
+# Every dependency is justified in the design notes (design.md section 6). Pinned in Cargo.lock.
+[dependencies]
+# Wipes the secret key (f, g, F, G), the expanded key (ffLDL tree, FFT basis), PRNG states,
+# secret-key encodings and scratch buffers on drop. Same version as the PCS and Jali (1.9). No
+# derive feature: every Zeroize impl is written by hand (slice wipes, about ten times cheaper
+# than the derived ones on Vec fields), which keeps syn and quote out of the build.
+zeroize = "1.9"
+# Stage-1 NTRUSolve (keygen only): the big-integer field-norm tower, the extended gcd of the
+# two resultants (about 9,650 bits at the PCS set), Kronecker products and Babai reduction.
+# 0.4.8 is the version already in the PCS Cargo.lock.
+num-bigint = "0.4.8"
+# `Integer::extended_gcd` for BigInt, and the Zero/One/Signed/ToPrimitive traits.
+num-integer = "0.1.47"
+num-traits = "0.2.19"
+
+[dev-dependencies]
+# Benchmarks (benches/sign.rs, benches/keygen.rs). Same major version as the PCS and Jali.
+criterion = "0.8"
+# TEST AND BENCH ONLY: bit-exact parity of SampPre with Pornin's fn-dsa at Falcon-1024's
+# parameters (q = 12289, its sigma and its 1.8205 base table), and the fn-dsa signing baseline
+# in the benchmarks. fn-dsa-comm gives hash_to_point and the key/signature codecs, which fn-dsa
+# does not re-export. Unlicense; never a dependency of the library itself.
+fn-dsa = "=0.4.0"
+fn-dsa-comm = "=0.4.0"
+# Known-answer vectors written in hex in the tests.
+hex = "0.4.3"
+
+[[bench]]
+name = "sign"
+harness = false
+
+[[bench]]
+name = "keygen"
+harness = false
+
+[[bench]]
+name = "e2e"
+harness = false
+
+[lints.rust]
+unsafe_code = "forbid"
+
+# Statistical tests draw 10^7 samples and more: optimise test builds.
+[profile.test]
+opt-level = 3

@@ -1,0 +1,134 @@
+ntru-trapdoor
+Copyright (c) 2026 Erkan Tairi
+Licensed under the MIT License (see LICENSE).
+
+This product contains code ported from the works listed below. Each entry names the source,
+the version that was read, what is ported, and the licence of the source.
+
+------------------------------------------------------------------------------------------------
+1. fn-dsa (Rust implementation of FN-DSA / Falcon)
+   Author:   Thomas Pornin
+   Source:   https://github.com/pornin/rust-fn-dsa, commit 0629bb1 (2026-07-30);
+             crates.io fn-dsa 0.4.0
+   Licence:  The Unlicense (public-domain dedication), reproduced below.
+   Ported (portable, non-SIMD code paths only; FLR replaced by native f64):
+     - fn-dsa-sign/src/poly.rs: FFT, iFFT, FFT-domain polynomial operations, LDL, split and
+       merge, the GM twiddle table                                   -> src/fft/
+     - fn-dsa-sign/src/sampler.rs: SamplerZ (next, gaussian0, ber_exp) and ffSampling
+       (ffsamp_fft_inner, split into a per-key tree builder and the sampling recursion; its
+       per-attempt form is also copied into a unit test of src/ffsamp.rs). Modified: ber_exp
+       uses the threshold 0 instead of a shift saturated at 63 when x >= 64 ln 2, and the
+       width-3.1 base draw is new (a 192-bit table, drawn lazily)
+                                                                     -> src/sampler.rs,
+                                                                        src/ffsamp.rs
+     - fn-dsa-sign/src/flr_native.rs: expm_p63 and its coefficients  -> src/sampler.rs
+     - fn-dsa-sign/src/lib.rs: the basis, Gram matrix, target and rounding steps of
+       sign_inner                                                    -> src/ffsamp.rs,
+                                                                        src/sign.rs
+     - fn-dsa-comm/src/shake.rs: Keccak-f[1600], SHAKE256, SHAKE256_PRNG -> src/prng.rs
+     - fn-dsa-kgen/src/mp31.rs and poly.rs: arithmetic modulo 31-bit primes and the NTT
+       (the CRT lift, the prepared products, the norm-tower inversion and the NTT check of
+       fG - gF = q around them are new)                              -> src/ring/
+     - the GAUSS0 table (fn-dsa-sign/src/sampler.rs:78-97)           -> src/tables.rs
+     - fn-dsa-comm/src/codec.rs:7-71: trim_i8_encode and trim_i8_decode, generalised from i8
+       to i16 coefficients, widths up to 16 bits and a zero-padded last byte
+                                                                     -> src/codec.rs
+     - fn-dsa-kgen/src/gauss.rs:30-81 (sample_f): the construction of the f, g sampler (a sign
+       bit and a half-Gaussian CDT), adapted to a 128-bit table, a binary search, a lazy draw
+       and no parity conditioning                                    -> src/keygen/gauss.rs
+     - fn-dsa-kgen/src/lib.rs:266-315 (keygen_from_seed): the structure of the candidate loop
+                                                                     -> src/keygen/trapgen.rs
+     - fn-dsa-kgen/src/lib.rs:292-302 and src/ntru.rs:18-43: the two Gram-Schmidt norm tests,
+       as formulas                                                   -> src/keygen/gs.rs
+   Test vectors: tests/fixtures/sign/fndsa_sign512_kat.txt and fndsa_sampler512_kat.txt hold
+   fn-dsa's own known-answer vectors (fn-dsa-sign/src/lib.rs:784-1151 and
+   fn-dsa-sign/src/sampler.rs:646-2816), extracted by tools/sign/extract_fndsa_kats.py;
+   tests/fixtures/parity/fndsa_vrfy_kat.txt holds its verification known-answer vectors
+   (fn-dsa-vrfy/src/lib.rs:419-914), extracted by tools/parity/extract_fndsa_vrfy_kats.py.
+   The fn-dsa and fn-dsa-comm crates are also dev-dependencies (test and benchmark only).
+
+   This is free and unencumbered software released into the public domain.
+
+   Anyone is free to copy, modify, publish, use, compile, sell, or
+   distribute this software, either in source code form or as a compiled
+   binary, for any purpose, commercial or non-commercial, and by any
+   means.
+
+   In jurisdictions that recognize copyright laws, the author or authors
+   of this software dedicate any and all copyright interest in the
+   software to the public domain. We make this dedication for the benefit
+   of the public at large and to the detriment of our heirs and
+   successors. We intend this dedication to be an overt act of
+   relinquishment in perpetuity of all present and future rights to this
+   software under copyright law.
+
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+   EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+   MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+   IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR
+   OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+   ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+   OTHER DEALINGS IN THE SOFTWARE.
+
+   For more information, please refer to <https://unlicense.org>
+
+------------------------------------------------------------------------------------------------
+2. falcon-rust
+   Author:   Alan Szepieniec
+   Source:   https://github.com/aszepieniec/falcon-rust, v0.3.1 (commit 7a5ba9b)
+   Licence:  MIT, reproduced below.
+   Ported:
+     - src/math.rs:68-216: babai_shifts and babai_reduce_bigint (the window schedule, the
+       overshoot fallback and the stopping rule), on fixed-width limbs
+                                                                     -> src/keygen/solve.rs,
+                                                                        src/keygen/flat.rs
+     - src/math.rs:1242-1303: the structure of ntru_solve            -> src/keygen/solve.rs
+     - src/polynomial.rs:257-309: field_norm and lift_next_cyclotomic, as formulas
+                                                                     -> src/keygen/bigpoly.rs,
+                                                                        src/keygen/flat.rs
+     - src/math.rs:1536-1568: gram_schmidt_norm_squared, as a formula -> src/keygen/gs.rs
+   Not ported: xgcd. src/keygen/xgcd.rs implements Lehmer's extended gcd (Knuth, TAOCP vol. 2,
+   section 4.5.2, Algorithm L).
+
+   MIT License
+
+   Copyright (c) 2026 Alan Szepieniec
+
+   Permission is hereby granted, free of charge, to any person obtaining a copy
+   of this software and associated documentation files (the "Software"), to deal
+   in the Software without restriction, including without limitation the rights
+   to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+   copies of the Software, and to permit persons to whom the Software is
+   furnished to do so, subject to the following conditions:
+
+   The above copyright notice and this permission notice shall be included in all
+   copies or substantial portions of the Software.
+
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+   FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+   AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+   LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+   SOFTWARE.
+
+------------------------------------------------------------------------------------------------
+3. Jali
+   Author:   Erkan Tairi (the author of this crate)
+   Source:   https://github.com/etairi/jali, commit 0cd24f3
+   Licence:  MIT (Copyright (c) 2026 Erkan Tairi, the same notice as LICENSE)
+   Ported:   tools/kat/half_gaussian_cdf.py (the interval-certified half-Gaussian table
+             generator)                                              -> tools/gauss_tables.py
+             Its regeneration of Jali's 256-bit HALF_3_1 table is identical to Jali's
+             src/rand/cdf.rs.
+
+------------------------------------------------------------------------------------------------
+Same-author material (no licence notice needed): tools/sign/precision_fixture.sage.py adapts a
+precision script of the author's library survey and, like tools/keygen/fixtures.sage.py, uses
+the author's exact Sage NTRUSolve oracle (ntru_sizes.py) of the same survey.
+
+------------------------------------------------------------------------------------------------
+Not (yet) ported, listed for completeness:
+   pqe-hawk (PQE Chain Contributors, MIT OR Apache-2.0), https://github.com/nixprotocol/pqe-hawk,
+   v0.1.3 (commit d00298a): a q-parametric RNS NTRU solver, a candidate for a faster
+   "stage 2" NTRUSolve. If it is ported, its licence notice must be added here.
