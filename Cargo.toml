@@ -1,6 +1,6 @@
 [package]
 name = "ntru-trapdoor"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 # The MSRV of the PCS, Jali and the OpenVTC workspace, the intended consumers.
 rust-version = "1.95"
