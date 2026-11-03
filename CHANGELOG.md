@@ -2,9 +2,9 @@
 
 All notable changes to this crate. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the crate follows
-[Semantic Versioning](https://semver.org/) once published.
+[Semantic Versioning](https://semver.org/).
 
-## [0.1.0] - unreleased
+## [0.1.0] - 2026-11-02
 
 First version. NTRU trapdoors in the DLP14 / Falcon convention for the lattice instantiation of the
 predicate credential system (PCS): `R_q` arithmetic for `q = 5 mod 8`, TrapGen, SampPre at
