@@ -17,7 +17,7 @@ PKC 2025), and ships that parameter set next to Falcon-1024's.
 
 ## Status
 
-ntru-trapdoor is research code, version 0.1, not yet published on crates.io.
+ntru-trapdoor is research code, version 0.1.
 
 - **Not audited.** No independent review of the code has taken place.
 - **Checked against fn-dsa.** At Falcon-1024's parameters, the preimage sampler reproduces Thomas
@@ -35,13 +35,12 @@ ntru-trapdoor is research code, version 0.1, not yet published on crates.io.
 
 ## Installation
 
-Until ntru-trapdoor is on crates.io, use it as a git dependency. It needs Rust 1.95 or later
-(edition 2024).
+ntru-trapdoor is on [crates.io](https://crates.io/crates/ntru-trapdoor). It needs Rust 1.95 or
+later (edition 2024).
 
 ```toml
 [dependencies]
-ntru-trapdoor = { git = "https://github.com/etairi/ntru-trapdoor" }
-# For reproducible builds, pin a commit: rev = "<commit>".
+ntru-trapdoor = "0.1"
 ```
 
 The crate forbids `unsafe` code. Its only dependencies are `zeroize` and, for key generation,
