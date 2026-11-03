@@ -4,13 +4,13 @@ ntru-trapdoor is a Rust library for NTRU lattice trapdoors. It generates NTRU ke
 with a short trapdoor basis, and samples short Gaussian preimages with Falcon's fast Fourier
 sampler. Unlike a Falcon signature library, it is parametric:
 
-- the sampler takes **any target** in $`R_q=\mathbb Z_q[x]/(x^d+1)`$, not only the hash of a
-  message;
-- the modulus can be **any prime** $`q<2^{25}`$, including $`q\equiv5\pmod8`$, where
-  $`x^d+1`$ has no full NTT;
+- the sampler takes **any target** in
+  *R*<sub>*q*</sub> = ℤ<sub>*q*</sub>\[*x*\]/(*x*<sup>*d*</sup> + 1), not only the hash of a message;
+- the modulus can be **any prime** *q* < 2<sup>25</sup>, including *q* ≡ 5 (mod 8), where
+  *x*<sup>*d*</sup> + 1 has no full NTT;
 - the Gaussian width is the one your application needs.
 
-It also provides exact arithmetic in $`R_q`$: multiplication, inversion and canonical
+It also provides exact arithmetic in *R*<sub>*q*</sub>: multiplication, inversion and canonical
 encodings. It was written for the lattice instantiation of a predicate credential system, whose
 credentials are signatures from vanishing short integer solutions (Dubois, Klooß, Lai and Woo,
 PKC 2025), and ships that parameter set next to Falcon-1024's.
