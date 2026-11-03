@@ -1,0 +1,2 @@
+# tools/gauss_tables.py (interval arithmetic). The Sage scripts (*.sage.py) need SageMath.
+mpmath==1.4.1
