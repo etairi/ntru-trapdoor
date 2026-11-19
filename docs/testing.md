@@ -52,33 +52,46 @@ with the exact NTRUSolve oracle of `tools/ntru_sizes.py`.
 
 ## Benchmarks
 
-Measured on 2026-10-04 on an Apple M4 (4 performance and 6 efficiency cores, 16 GB), macOS
-27.0.1, rustc 1.99.0, criterion 0.8.2, release profile, one thread unless stated. The laptop ran
-other applications (1-minute load average 3.4-5.9). Medians of `benches/{sign,keygen,e2e}.rs`;
-expect a few percent between runs.
+Measured on 2026-11-18 and 2026-11-19 with rustc 1.100.0, criterion 0.8.2 and the release profile,
+one thread unless stated. Medians of `benches/{sign,keygen,e2e}.rs`.
 
-| Operation | PCS | Falcon-1024 |
-|---|---|---|
-| TrapGen (fresh seed per iteration) | 5.87 ms | 4.10 ms |
-| NTRUSolve, one solve | 4.57 ms | 2.61 ms |
-| `ExpandedKey::new` for a generated or decoded key | 51.5 µs | 51.5 µs |
-| `ExpandedKey::new` for a `from_parts` key (validation included) | 122 µs | 122 µs |
-| SampPre, one call | 161 µs | 194 µs |
-| SampPre throughput, 1 / 2 / 4 / 8 threads sharing one key | 6,180 / 12,030 / 19,420 / 25,370 calls/s | |
-| Verify | 20.8 µs | 20.8 µs |
-| `R_q` multiplication | 28.2 µs | 28.3 µs |
-| `R_q` multiplication by a prepared operand / its preparation | 18.6 µs / 9.0 µs | |
-| `R_q` inversion | 57.9 µs | 57.5 µs |
-| invertibility test | 29.5 µs | |
-| `SecretKey::validate` | 71.7 µs | |
-| secret-key decoding, validation included | 76.5 µs | 75.7 µs |
-| public-key decoding | 2.0 µs | 1.25 µs |
-| fn-dsa 0.4.0 signing, for comparison | | 210 µs |
+- Apple M4 (4 performance and 6 efficiency cores, 16 GB), macOS 27.2. The laptop ran other
+  applications (1-minute load average 3 to 7), so the figures move by about 5 % between runs.
+- Intel Xeon Platinum 8581C (Emerald Rapids), a Google Cloud c4-standard-8 VM (4 cores, 8
+  threads), Ubuntu 24.04, with nothing else running and the benchmark pinned to one core. Built
+  for the default target (x86-64 with SSE2) unless stated.
 
-At the PCS set, SampPre spends about 115 µs on its 2048 leaf samples (about 56 ns each, of which
-SHAKE256 output is about 18 ns) and the rest on the FFT, the tree and the lattice-point
-arithmetic. TrapGen is dominated by NTRUSolve on resultants of about 9.6 kbit, with 20.2
-candidates per key on average.
+| Operation | M4, PCS | M4, Falcon-1024 | Xeon, PCS | Xeon, Falcon-1024 |
+|---|---|---|---|---|
+| TrapGen (fresh seed per iteration) | 6.01 ms | 4.17 ms | 9.66 ms | 6.89 ms |
+| `trapgen_expanded` (TrapGen and the expanded key) | 6.03 ms | 4.22 ms | 9.52 ms | 6.94 ms |
+| NTRUSolve, one solve | 4.71 ms | 2.74 ms | 7.40 ms | 4.52 ms |
+| `ExpandedKey::new` for a generated or decoded key | 52.8 µs | 53.5 µs | 84.4 µs | 85.3 µs |
+| `ExpandedKey::new` for a `from_parts` key (validation included) | 123 µs | 124 µs | 209 µs | 208 µs |
+| SampPre, one call | 146 µs | 186 µs | 291 µs | 329 µs |
+| SampPre throughput, 1 / 2 / 4 / 8 threads sharing one key | 6,750 / 12,190 / 19,250 / 27,150 calls/s | | 3,390 / 6,780 / 13,590 / 15,560 calls/s | |
+| `samp_pre_batch` of 256 calls, sequential / with the `parallel` feature | 38.1 ms / 7.8 ms | | 74.1 ms / 17.1 ms | |
+| Verify | 20.1 µs | 20.1 µs | 43.5 µs | 43.3 µs |
+| `R_q` multiplication | 27.7 µs | 27.1 µs | 51.0 µs | 51.1 µs |
+| `R_q` multiplication by a prepared operand / its preparation | 17.9 µs / 8.4 µs | | 35.7 µs / 15.0 µs | |
+| `PreparedRqPoly::mul_ternary` | 8.9 µs | | 17.6 µs | |
+| sum of four products with ternary operands: `mul` each / `mul_ternary` each / `sum_of_products` | 72.0 / 36.7 / 46.0 µs | | 143 / 71.0 / 83.8 µs | |
+| `R_q` inversion | 57.6 µs | 56.1 µs | 107 µs | 108 µs |
+| invertibility test | 27.5 µs | | 55.5 µs | |
+| `SecretKey::validate` | 67.5 µs | | 123 µs | |
+| secret-key decoding, validation included | 73.1 µs | 72.9 µs | 138 µs | 135 µs |
+| public-key decoding | 2.07 µs | 1.38 µs | 5.31 µs | 3.09 µs |
+| fn-dsa 0.4.0 signing, for comparison | | 211 µs | | 422 µs |
+
+The `parallel` rows use every core: 10 on the M4 (6 of them efficiency cores) and 8 threads on
+the Xeon. Built with `-C target-cpu=x86-64-v3` (AVX2, BMI2), the Xeon computes SampPre in 262 µs
+and 297 µs, Verify in 32.6 µs and a multiplication in 41.8 µs, with the same outputs. With
+`-C target-cpu=native` (AVX-512) SampPre at `Params::PCS` took longer instead (320 µs).
+
+At `Params::PCS`, SampPre spends about 109 µs on its 2048 leaf samples (about 53 ns each on the M4)
+and the rest on the FFT, the tree and the lattice-point arithmetic. A profile attributes about
+52 % of its time to the leaf sampler and 27 % to the SHAKE256 permutation. TrapGen is dominated by
+NTRUSolve on resultants of about 9.6 kbit, with 20.2 candidates per key on average.
 
 ## Interoperability with fn-dsa
 
@@ -87,7 +100,9 @@ fn-dsa's verifying key stores `h` in its NTT representation, not in coefficient 
 
 ## Limitations of the testing
 
-- Only aarch64 has been tested. On x86-64, fn-dsa runs other code paths, so the parity tests have
-  not been run there.
+- On x86-64 (the Xeon above, Ubuntu 24.04, rustc 1.100.0) the whole suite passes, the long tests
+  and the parity tests against fn-dsa included, for the default target. The unit, known-answer
+  and parity tests also pass with `-C target-cpu=x86-64-v3` and `-C target-cpu=native`. Other
+  x86-64 processors and compilers have not been tested.
 - The MSRV, 1.95, has not been run itself: the code was checked with rustc 1.93.1 and tested with
   1.99.0.

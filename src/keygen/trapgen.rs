@@ -51,6 +51,15 @@ pub(crate) fn trapgen_with_stats(
     params: &Params,
     seed: &[u8; 32],
 ) -> Result<(PublicKey, SecretKey, KeygenStats), Error> {
+    trapgen_full(params, seed).map(|(pk, sk, _, stats)| (pk, sk, stats))
+}
+
+/// The candidate loop, returning the key pair, the expanded key built by the leaf check of
+/// the accepted candidate, and the counters.
+pub(crate) fn trapgen_full(
+    params: &Params,
+    seed: &[u8; 32],
+) -> Result<(PublicKey, SecretKey, ExpandedKey, KeygenStats), Error> {
     params.validate()?;
     params.check_leaf_window()?;
     let n = params.n();
@@ -63,7 +72,7 @@ pub(crate) fn trapgen_with_stats(
         gauss::sample_fg(params, &mut prng, &mut f);
         gauss::sample_fg(params, &mut prng, &mut g);
         match from_fg_checked(params, &f, &g) {
-            Ok((pk, sk)) => return Ok((pk, sk, stats)),
+            Ok((pk, sk, ek)) => return Ok((pk, sk, ek, stats)),
             Err(KeygenReject::NormFg) => stats.rejected_norm_fg += 1,
             Err(KeygenReject::NormOrtho) => stats.rejected_norm_ortho += 1,
             Err(KeygenReject::NotInvertible) => stats.rejected_not_invertible += 1,
@@ -90,15 +99,16 @@ pub(crate) fn trapgen_from_fg(
     if params.validate().is_err() {
         return Err(KeygenReject::Input);
     }
-    from_fg_checked(params, f, g)
+    from_fg_checked(params, f, g).map(|(pk, sk, _)| (pk, sk))
 }
 
-/// [`trapgen_from_fg`] for parameters that passed [`Params::validate`].
+/// [`trapgen_from_fg`] for parameters that passed [`Params::validate`], also returning the
+/// expanded key that the leaf check builds.
 fn from_fg_checked(
     params: &Params,
     f: &[i16],
     g: &[i16],
-) -> Result<(PublicKey, SecretKey), KeygenReject> {
+) -> Result<(PublicKey, SecretKey, ExpandedKey), KeygenReject> {
     let n = params.n();
     if f.len() != n || g.len() != n {
         return Err(KeygenReject::Input);
@@ -151,13 +161,14 @@ fn from_fg_checked(
         return Err(KeygenReject::Solve);
     }
     sk.validated = true;
-    // 7. The ffLDL tree and its leaf check (the expanded key is wiped when dropped).
-    match ExpandedKey::from_valid(&sk) {
-        Ok(ek) => drop(ek),
+    // 7. The ffLDL tree and its leaf check. The expanded key is returned: `trapgen_expanded`
+    // keeps it, the other entry points drop it (it is wiped when dropped).
+    let ek = match ExpandedKey::from_valid(&sk) {
+        Ok(ek) => ek,
         Err(Error::LeafOutOfRange) => return Err(KeygenReject::Leaf),
         Err(_) => return Err(KeygenReject::Input),
-    }
-    Ok((PublicKey::from_valid(params, h), sk))
+    };
+    Ok((PublicKey::from_valid(params, h), sk, ek))
 }
 
 /// [`SecretKey::public_key`].

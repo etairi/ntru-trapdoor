@@ -25,6 +25,11 @@
 //! which are exact symmetries, and in the sign of some zero results), so the parity tests
 //! against fn-dsa hold on aarch64 too.
 //!
+//! The fused passes of SampPre and ffSampling (`poly_target_fft`, `poly_lattice_point_fft`,
+//! `merge_sub_mul_add_split`) run several of these functions in one loop, with each function's
+//! operations on each value, so they are bit-identical to the sequence of calls (tests
+//! `split_merge_and_fused_node_bit_exact` and `fused_target_and_lattice_point_bit_exact`).
+//!
 //! Also used by key generation (the Gram–Schmidt norms and the Babai reduction of NTRUSolve):
 //! every `pub fn` below.
 
@@ -139,7 +144,9 @@ pub fn poly_add(logn: u32, a: &mut [f64], b: &[f64]) {
     }
 }
 
-/// `a <- a - b` (either representation; fn-dsa poly.rs:599-652).
+/// `a <- a - b` (either representation; fn-dsa poly.rs:599-652). ffSampling now computes this
+/// step inside [`merge_sub_mul_add_split`]; the tests use it as the unfused reference.
+#[allow(dead_code)] // callers: the tests
 pub fn poly_sub(logn: u32, a: &mut [f64], b: &[f64]) {
     let n = 1usize << logn;
     for (x, &y) in a[..n].iter_mut().zip(b[..n].iter()) {
@@ -156,6 +163,7 @@ pub fn poly_neg(logn: u32, a: &mut [f64]) {
 }
 
 /// `a <- a * b` (FFT representation; fn-dsa poly.rs:718-805, portable branch :793-804).
+#[allow(dead_code)] // callers: the tests (references of the fused passes)
 pub fn poly_mul_fft(logn: u32, a: &mut [f64], b: &[f64]) {
     let hn = 1usize << (logn - 1);
     let (a_re, a_im) = a[..2 * hn].split_at_mut(hn);
@@ -201,6 +209,7 @@ pub fn poly_mulownadj_fft(logn: u32, a: &mut [f64]) {
 }
 
 /// `a <- a * x` for a real constant `x` (either representation; fn-dsa poly.rs:972-1023).
+#[allow(dead_code)] // callers: the tests (references of the fused passes)
 pub fn poly_mulconst(logn: u32, a: &mut [f64], x: f64) {
     let n = 1usize << logn;
     for v in a[..n].iter_mut() {
@@ -269,18 +278,26 @@ pub fn poly_split_fft(logn: u32, f0: &mut [f64], f1: &mut [f64], f: &[f64]) {
     }
     let hn = 1usize << (logn - 1);
     let qn = hn >> 1;
+    // The pairs (f[2i], f[2i + 1]) of each half, and the twiddles GM[2(i + hn)], read through
+    // chunks of two: the same operations on the same values as fn-dsa's indexed loop.
+    let (f_re, f_im) = f[..2 * hn].split_at(hn);
+    let (f0_re, f0_im) = f0[..hn].split_at_mut(qn);
+    let (f1_re, f1_im) = f1[..hn].split_at_mut(qn);
+    let (re2, _) = f_re.as_chunks::<2>();
+    let (im2, _) = f_im.as_chunks::<2>();
+    let (gm2, _) = GM[2 * hn..3 * hn].as_chunks::<2>();
     for i in 0..qn {
-        let (a_re, a_im) = (f[i << 1], f[(i << 1) + hn]);
-        let (b_re, b_im) = (f[(i << 1) + 1], f[(i << 1) + 1 + hn]);
+        let [a_re, b_re] = re2[i];
+        let [a_im, b_im] = im2[i];
 
         let (t_re, t_im) = (a_re + b_re, a_im + b_im);
-        f0[i] = t_re * 0.5;
-        f0[i + qn] = t_im * 0.5;
+        f0_re[i] = t_re * 0.5;
+        f0_im[i] = t_im * 0.5;
 
         let (t_re, t_im) = (a_re - b_re, a_im - b_im);
-        let (u_re, u_im) = flc_mul(t_re, t_im, GM[(i + hn) << 1], -GM[((i + hn) << 1) + 1]);
-        f1[i] = u_re * 0.5;
-        f1[i + qn] = u_im * 0.5;
+        let (u_re, u_im) = flc_mul(t_re, t_im, gm2[i][0], -gm2[i][1]);
+        f1_re[i] = u_re * 0.5;
+        f1_im[i] = u_im * 0.5;
     }
 }
 
@@ -321,18 +338,142 @@ pub fn poly_merge_fft(logn: u32, f: &mut [f64], f0: &[f64], f1: &[f64]) {
     }
     let hn = 1usize << (logn - 1);
     let qn = hn >> 1;
+    // As in poly_split_fft: pairs of each half and the twiddles through chunks of two.
+    let (f_re, f_im) = f[..2 * hn].split_at_mut(hn);
+    let (f0_re, f0_im) = f0[..hn].split_at(qn);
+    let (f1_re, f1_im) = f1[..hn].split_at(qn);
+    let (re2, _) = f_re.as_chunks_mut::<2>();
+    let (im2, _) = f_im.as_chunks_mut::<2>();
+    let (gm2, _) = GM[2 * hn..3 * hn].as_chunks::<2>();
     for i in 0..qn {
-        let (a_re, a_im) = (f0[i], f0[i + qn]);
-        let (b_re, b_im) = flc_mul(
-            f1[i],
-            f1[i + qn],
-            GM[(i + hn) << 1],
-            GM[((i + hn) << 1) + 1],
-        );
-        f[i << 1] = a_re + b_re;
-        f[(i << 1) + hn] = a_im + b_im;
-        f[(i << 1) + 1] = a_re - b_re;
-        f[(i << 1) + 1 + hn] = a_im - b_im;
+        let (a_re, a_im) = (f0_re[i], f0_im[i]);
+        let (b_re, b_im) = flc_mul(f1_re[i], f1_im[i], gm2[i][0], gm2[i][1]);
+        re2[i] = [a_re + b_re, a_re - b_re];
+        im2[i] = [a_im + b_im, a_im - b_im];
+    }
+}
+
+/// SampPre's target in one pass (fn-dsa lib.rs:621-640): from `t0` = FFT(t), `t1 <- t0 * b01 *
+/// (-inv_q)` and `t0 <- t0 * b11 * inv_q`. The same operations per value as `poly_mul_fft`
+/// followed by `poly_mulconst`, for each of the two products.
+pub(crate) fn poly_target_fft(
+    logn: u32,
+    t0: &mut [f64],
+    t1: &mut [f64],
+    b01: &[f64],
+    b11: &[f64],
+    inv_q: f64,
+) {
+    let hn = 1usize << (logn - 1);
+    let ninv_q = -inv_q;
+    let (t0_re, t0_im) = t0[..2 * hn].split_at_mut(hn);
+    let (t1_re, t1_im) = t1[..2 * hn].split_at_mut(hn);
+    let (b01_re, b01_im) = b01[..2 * hn].split_at(hn);
+    let (b11_re, b11_im) = b11[..2 * hn].split_at(hn);
+    for j in 0..hn {
+        let (x_re, x_im) = (t0_re[j], t0_im[j]);
+        let (y_re, y_im) = flc_mul(x_re, x_im, b01_re[j], b01_im[j]);
+        t1_re[j] = y_re * ninv_q;
+        t1_im[j] = y_im * ninv_q;
+        let (y_re, y_im) = flc_mul(x_re, x_im, b11_re[j], b11_im[j]);
+        t0_re[j] = y_re * inv_q;
+        t0_im[j] = y_im * inv_q;
+    }
+}
+
+/// SampPre's lattice point in one pass (fn-dsa lib.rs:673-689): `(z0, z1)` in `(t0, t1)` becomes
+/// `v0 = z0 b00 + z1 b10` in `t0` and `v1 = z1 b11 + z0 b01` in `t1`, with the operations of
+/// `poly_mul_fft` and `poly_add` and the operand order of fn-dsa's sequence.
+pub(crate) fn poly_lattice_point_fft(
+    logn: u32,
+    t0: &mut [f64],
+    t1: &mut [f64],
+    basis: (&[f64], &[f64], &[f64], &[f64]),
+) {
+    let hn = 1usize << (logn - 1);
+    let (b00, b01, b10, b11) = basis;
+    let (t0_re, t0_im) = t0[..2 * hn].split_at_mut(hn);
+    let (t1_re, t1_im) = t1[..2 * hn].split_at_mut(hn);
+    let (b00_re, b00_im) = b00[..2 * hn].split_at(hn);
+    let (b01_re, b01_im) = b01[..2 * hn].split_at(hn);
+    let (b10_re, b10_im) = b10[..2 * hn].split_at(hn);
+    let (b11_re, b11_im) = b11[..2 * hn].split_at(hn);
+    for j in 0..hn {
+        let (z0_re, z0_im) = (t0_re[j], t0_im[j]);
+        let (z1_re, z1_im) = (t1_re[j], t1_im[j]);
+        let (a_re, a_im) = flc_mul(z0_re, z0_im, b00_re[j], b00_im[j]);
+        let (b_re, b_im) = flc_mul(z1_re, z1_im, b10_re[j], b10_im[j]);
+        t0_re[j] = a_re + b_re;
+        t0_im[j] = a_im + b_im;
+        let (c_re, c_im) = flc_mul(z0_re, z0_im, b01_re[j], b01_im[j]);
+        let (d_re, d_im) = flc_mul(z1_re, z1_im, b11_re[j], b11_im[j]);
+        t1_re[j] = d_re + c_re;
+        t1_im[j] = d_im + c_im;
+    }
+}
+
+/// One node of ffSampling between its two recursive calls, fused into a single pass for
+/// `logn >= 2`: merge `z1` from the right subtree's output `(w0, w1)` into `t1` (whose old
+/// value is read first), form `tb0 = t0 + (t1 - z1) * l10`, and split `tb0` into `(w0, w1)` for
+/// the left subtree. `t0` is only read (the caller overwrites it with the final merge).
+///
+/// Every value is computed by the operations, in the order, of the unfused sequence
+/// `poly_merge_fft(z1, w0, w1)`, `poly_sub(t1 - z1)`, `poly_mul_fft(_, l10)`, `poly_add(t0, _)`,
+/// `poly_split_fft(w0, w1, tb0)`, so the results are bit-identical. `w` holds `w0` then `w1`
+/// (`n/2` values each).
+pub(crate) fn merge_sub_mul_add_split(
+    logn: u32,
+    w: &mut [f64],
+    t0: &[f64],
+    t1: &mut [f64],
+    l10: &[f64],
+) {
+    debug_assert!(logn >= 2);
+    let n = 1usize << logn;
+    let hn = n >> 1;
+    let qn = hn >> 1;
+    let (w0, w1) = w[..n].split_at_mut(hn);
+    let (w0_re, w0_im) = w0.split_at_mut(qn);
+    let (w1_re, w1_im) = w1.split_at_mut(qn);
+    let (t0_re, t0_im) = t0[..n].split_at(hn);
+    let (t1_re, t1_im) = t1[..n].split_at_mut(hn);
+    let (l_re, l_im) = l10[..n].split_at(hn);
+    let (t0_re2, _) = t0_re.as_chunks::<2>();
+    let (t0_im2, _) = t0_im.as_chunks::<2>();
+    let (t1_re2, _) = t1_re.as_chunks_mut::<2>();
+    let (t1_im2, _) = t1_im.as_chunks_mut::<2>();
+    let (l_re2, _) = l_re.as_chunks::<2>();
+    let (l_im2, _) = l_im.as_chunks::<2>();
+    let (gm2, _) = GM[2 * hn..3 * hn].as_chunks::<2>();
+    for i in 0..qn {
+        let [g_re, g_im] = gm2[i];
+        // poly_merge_fft: z1 at 2i (a + b) and 2i + 1 (a - b).
+        let (a_re, a_im) = (w0_re[i], w0_im[i]);
+        let (b_re, b_im) = flc_mul(w1_re[i], w1_im[i], g_re, g_im);
+        let z_re = [a_re + b_re, a_re - b_re];
+        let z_im = [a_im + b_im, a_im - b_im];
+        // poly_sub, poly_mul_fft and poly_add at 2i and 2i + 1; z1 into t1.
+        let mut tb_re = [0.0f64; 2];
+        let mut tb_im = [0.0f64; 2];
+        for k in 0..2 {
+            let x_re = t1_re2[i][k] - z_re[k];
+            let x_im = t1_im2[i][k] - z_im[k];
+            let (y_re, y_im) = flc_mul(x_re, x_im, l_re2[i][k], l_im2[i][k]);
+            tb_re[k] = t0_re2[i][k] + y_re;
+            tb_im[k] = t0_im2[i][k] + y_im;
+        }
+        t1_re2[i] = z_re;
+        t1_im2[i] = z_im;
+        // poly_split_fft of tb0 at i.
+        let [a_re, b_re] = tb_re;
+        let [a_im, b_im] = tb_im;
+        let (t_re, t_im) = (a_re + b_re, a_im + b_im);
+        w0_re[i] = t_re * 0.5;
+        w0_im[i] = t_im * 0.5;
+        let (t_re, t_im) = (a_re - b_re, a_im - b_im);
+        let (u_re, u_im) = flc_mul(t_re, t_im, g_re, -g_im);
+        w1_re[i] = u_re * 0.5;
+        w1_im[i] = u_im * 0.5;
     }
 }
 
@@ -577,6 +718,168 @@ mod tests {
                     assert!(close(x0[j], y0[j]) && close(x1[j], y1[j]));
                 }
             }
+        }
+    }
+
+    /// fn-dsa's indexed `poly_split_fft` loop (poly.rs:1342-1363), verbatim: the reference of
+    /// the chunked rewrite.
+    fn split_fndsa(logn: u32, f0: &mut [f64], f1: &mut [f64], f: &[f64]) {
+        if logn == 1 {
+            f0[0] = f[0];
+            f1[0] = f[1];
+            return;
+        }
+        let hn = 1usize << (logn - 1);
+        let qn = hn >> 1;
+        for i in 0..qn {
+            let (a_re, a_im) = (f[i << 1], f[(i << 1) + hn]);
+            let (b_re, b_im) = (f[(i << 1) + 1], f[(i << 1) + 1 + hn]);
+            let (t_re, t_im) = (a_re + b_re, a_im + b_im);
+            f0[i] = t_re * 0.5;
+            f0[i + qn] = t_im * 0.5;
+            let (t_re, t_im) = (a_re - b_re, a_im - b_im);
+            let (u_re, u_im) = flc_mul(t_re, t_im, GM[(i + hn) << 1], -GM[((i + hn) << 1) + 1]);
+            f1[i] = u_re * 0.5;
+            f1[i + qn] = u_im * 0.5;
+        }
+    }
+
+    /// fn-dsa's indexed `poly_merge_fft` loop (poly.rs:1541-1557), verbatim.
+    fn merge_fndsa(logn: u32, f: &mut [f64], f0: &[f64], f1: &[f64]) {
+        if logn == 1 {
+            f[0] = f0[0];
+            f[1] = f1[0];
+            return;
+        }
+        let hn = 1usize << (logn - 1);
+        let qn = hn >> 1;
+        for i in 0..qn {
+            let (a_re, a_im) = (f0[i], f0[i + qn]);
+            let (b_re, b_im) = flc_mul(
+                f1[i],
+                f1[i + qn],
+                GM[(i + hn) << 1],
+                GM[((i + hn) << 1) + 1],
+            );
+            f[i << 1] = a_re + b_re;
+            f[(i << 1) + hn] = a_im + b_im;
+            f[(i << 1) + 1] = a_re - b_re;
+            f[(i << 1) + 1 + hn] = a_im - b_im;
+        }
+    }
+
+    fn bits(v: &[f64]) -> Vec<u64> {
+        v.iter().map(|x| x.to_bits()).collect()
+    }
+
+    /// The chunked split and merge, and the fused node pass of ffSampling, equal their unfused
+    /// fn-dsa sequences bit for bit at every size (FFT-domain inputs, so non-integer values).
+    #[test]
+    fn split_merge_and_fused_node_bit_exact() {
+        for logn in 1..=10u32 {
+            let n = 1usize << logn;
+            let hn = n / 2;
+            let mut rng = Shake256Prng::new(&[0xCC, logn as u8]);
+            for _ in 0..4 {
+                let mut f = vec![0.0; n];
+                rand_poly(&mut rng, &mut f);
+                fft(logn, &mut f);
+                let (mut a0, mut a1) = (vec![0.0; hn], vec![0.0; hn]);
+                let (mut b0, mut b1) = (vec![0.0; hn], vec![0.0; hn]);
+                poly_split_fft(logn, &mut a0, &mut a1, &f);
+                split_fndsa(logn, &mut b0, &mut b1, &f);
+                assert_eq!(
+                    (bits(&a0), bits(&a1)),
+                    (bits(&b0), bits(&b1)),
+                    "split {logn}"
+                );
+                let (mut m, mut mr) = (vec![0.0; n], vec![0.0; n]);
+                poly_merge_fft(logn, &mut m, &a0, &a1);
+                merge_fndsa(logn, &mut mr, &a0, &a1);
+                assert_eq!(bits(&m), bits(&mr), "merge {logn}");
+                if logn < 2 {
+                    continue;
+                }
+                // The node pass: w = (w0, w1) from the right subtree, targets t0, t1, l10.
+                let mut t0 = vec![0.0; n];
+                let mut t1 = vec![0.0; n];
+                let mut l10 = vec![0.0; n];
+                let mut w = vec![0.0; n];
+                for v in [&mut t0, &mut t1, &mut l10, &mut w] {
+                    rand_poly(&mut rng, v);
+                    fft(logn, v);
+                }
+                for x in l10.iter_mut() {
+                    *x /= 1024.0 + 0.5;
+                }
+                // Unfused: z1 = merge(w0, w1); x = t1 - z1; t1 = z1; x *= l10; t0 += x;
+                // (w0, w1) = split(t0).
+                let mut z1 = vec![0.0; n];
+                merge_fndsa(logn, &mut z1, &w[..hn], &w[hn..]);
+                let mut x = t1.clone();
+                poly_sub(logn, &mut x, &z1);
+                let t1_ref = z1.clone();
+                poly_mul_fft(logn, &mut x, &l10);
+                let mut tb0 = t0.clone();
+                poly_add(logn, &mut tb0, &x);
+                let (mut r0, mut r1) = (vec![0.0; hn], vec![0.0; hn]);
+                split_fndsa(logn, &mut r0, &mut r1, &tb0);
+                // Fused.
+                let t0_in = t0.clone();
+                merge_sub_mul_add_split(logn, &mut w, &t0, &mut t1, &l10);
+                assert_eq!(bits(&t0), bits(&t0_in), "t0 is read only");
+                assert_eq!(bits(&t1), bits(&t1_ref), "z1 {logn}");
+                assert_eq!(bits(&w[..hn]), bits(&r0), "w0 {logn}");
+                assert_eq!(bits(&w[hn..]), bits(&r1), "w1 {logn}");
+            }
+        }
+    }
+
+    /// The fused target and lattice-point passes of SampPre equal fn-dsa's unfused sequences
+    /// bit for bit.
+    #[test]
+    fn fused_target_and_lattice_point_bit_exact() {
+        for logn in 1..=10u32 {
+            let n = 1usize << logn;
+            let mut rng = Shake256Prng::new(&[0xDD, logn as u8]);
+            let mut v: Vec<Vec<f64>> = (0..6).map(|_| vec![0.0; n]).collect();
+            for x in v.iter_mut() {
+                rand_poly(&mut rng, x);
+                fft(logn, x);
+            }
+            let (b00, b01, b10, b11, z0, z1) = (&v[0], &v[1], &v[2], &v[3], &v[4], &v[5]);
+            let inv_q = 1.0 / 1048573.0;
+            // Target, unfused (the code of samp_pre_with before the fusion).
+            let mut r0 = z0.clone();
+            let mut r1 = r0.clone();
+            poly_mul_fft(logn, &mut r1, b01);
+            poly_mulconst(logn, &mut r1, -inv_q);
+            poly_mul_fft(logn, &mut r0, b11);
+            poly_mulconst(logn, &mut r0, inv_q);
+            let (mut f0, mut f1) = (z0.clone(), vec![0.0; n]);
+            poly_target_fft(logn, &mut f0, &mut f1, b01, b11, inv_q);
+            assert_eq!(
+                (bits(&f0), bits(&f1)),
+                (bits(&r0), bits(&r1)),
+                "target {logn}"
+            );
+            // Lattice point, unfused.
+            let (mut tx, mut ty) = (z0.clone(), z1.clone());
+            poly_mul_fft(logn, &mut tx, b00);
+            poly_mul_fft(logn, &mut ty, b10);
+            poly_add(logn, &mut tx, &ty);
+            let mut ty = z0.clone();
+            poly_mul_fft(logn, &mut ty, b01);
+            let mut w1 = z1.clone();
+            poly_mul_fft(logn, &mut w1, b11);
+            poly_add(logn, &mut w1, &ty);
+            let (mut g0, mut g1) = (z0.clone(), z1.clone());
+            poly_lattice_point_fft(logn, &mut g0, &mut g1, (b00, b01, b10, b11));
+            assert_eq!(
+                (bits(&g0), bits(&g1)),
+                (bits(&tx), bits(&w1)),
+                "point {logn}"
+            );
         }
     }
 }

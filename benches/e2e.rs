@@ -14,7 +14,10 @@ use std::hint::black_box;
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use ntru_trapdoor::hazmat::{Prng, Shake256Prng};
-use ntru_trapdoor::{ExpandedKey, Params, PublicKey, RqPoly, SecretKey, samp_pre, trapgen, verify};
+use ntru_trapdoor::{
+    ExpandedKey, Params, PublicKey, RqPoly, SecretKey, samp_pre, samp_pre_batch, trapgen,
+    trapgen_expanded, verify,
+};
 
 fn seed(tag: u8, k: u64) -> [u8; 32] {
     let mut s = [tag; 32];
@@ -52,6 +55,14 @@ fn bench_setup(c: &mut Criterion) {
                 let (pk, sk) = trapgen(&p, &seed(0xe1, k)).unwrap();
                 let ek = ExpandedKey::new(&sk).unwrap();
                 black_box((pk, sk, ek))
+            })
+        });
+        // The same keys through `trapgen_expanded` (the leaf check's expanded key is kept).
+        let mut k = 0u64;
+        g.bench_function(format!("trapgen_expanded/{name}"), |b| {
+            b.iter(|| {
+                k += 1;
+                black_box(trapgen_expanded(&p, &seed(0xe1, k)).unwrap())
             })
         });
     }
@@ -149,6 +160,20 @@ fn bench_throughput(c: &mut Criterion) {
             })
         });
     }
+    // `samp_pre_batch` over 256 targets: sequential by default, on rayon's pool with the
+    // `parallel` feature (`cargo bench --bench e2e --features parallel`).
+    const BATCH: usize = 256;
+    let seeds: Vec<[u8; 32]> = (0..BATCH as u64).map(|k| seed(0xe8, k)).collect();
+    let items: Vec<(&RqPoly, &[u8; 32])> = (0..BATCH).map(|i| (&ts[i % 64], &seeds[i])).collect();
+    g.throughput(Throughput::Elements(BATCH as u64));
+    let feature = if cfg!(feature = "parallel") {
+        "parallel"
+    } else {
+        "sequential"
+    };
+    g.bench_function(format!("samp_pre_batch/pcs/{BATCH}_{feature}"), |b| {
+        b.iter(|| black_box(samp_pre_batch(&ek, black_box(&items))))
+    });
     g.finish();
 }
 

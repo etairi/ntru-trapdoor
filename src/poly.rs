@@ -176,24 +176,40 @@ impl fmt::Debug for RqPoly {
 /// the public key $`h`$ ([`crate::PublicKey::h_prepared`]) or the PCS's public parameters.
 ///
 /// Not wiped on drop (prepared operands are normally public); [`Zeroize`] is implemented.
-/// `Debug` prints the modulus and the degree only.
-#[derive(Clone, PartialEq, Eq)]
+/// `Debug` prints the modulus and the degree only. Equality compares the element (its
+/// residues), not the cache of [`PreparedRqPoly::mul_ternary`].
+#[derive(Clone)]
 pub struct PreparedRqPoly {
     /// The modulus $`q`$.
     pub(crate) q: u32,
     /// $`\log_2 d`$.
     pub(crate) logn: u32,
-    /// NTT of $`a`$ modulo $`p_1`$ ($`d`$ values).
+    /// NTT of $`a`$ modulo $`p_1`$ ($`d`$ values), times $`2^{32}/d`$ (the prepared form).
     pub(crate) r1: Vec<u32>,
-    /// NTT of $`a`$ modulo $`p_2`$ ($`d`$ values).
+    /// NTT of $`a`$ modulo $`p_2`$ ($`d`$ values), times $`2^{32}/d`$.
     pub(crate) r2: Vec<u32>,
+    /// The same for the centred lift of $`a`$ modulo $`p_1`$ alone, built on the first
+    /// [`PreparedRqPoly::mul_ternary`] that can use a single prime.
+    pub(crate) rc1: std::sync::OnceLock<Vec<u32>>,
 }
+
+impl PartialEq for PreparedRqPoly {
+    fn eq(&self, other: &Self) -> bool {
+        self.q == other.q && self.logn == other.logn && self.r1 == other.r1 && self.r2 == other.r2
+    }
+}
+
+impl Eq for PreparedRqPoly {}
 
 impl Zeroize for PreparedRqPoly {
     /// Wipes the residues and empties them.
     fn zeroize(&mut self) {
         wipe_vec(&mut self.r1);
         wipe_vec(&mut self.r2);
+        if let Some(v) = self.rc1.get_mut() {
+            wipe_vec(v);
+        }
+        self.rc1 = std::sync::OnceLock::new();
     }
 }
 

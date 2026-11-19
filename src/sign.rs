@@ -40,7 +40,7 @@
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::ffsamp::ffsampling;
-use crate::fft::{fft, ifft, poly_add, poly_mul_fft, poly_mulconst};
+use crate::fft::{fft, ifft, poly_lattice_point_fft, poly_target_fft};
 use crate::prng::{Prng, Shake256Prng, shake256};
 use crate::ring::ntt::{self, ModQ};
 use crate::sampler::{LeafSampler, SamplerZ};
@@ -87,6 +87,31 @@ pub fn samp_pre(ek: &ExpandedKey, t: &RqPoly, seed: &[u8; 32]) -> Result<Preimag
     Err(Error::SampPreExhausted)
 }
 
+/// [`samp_pre`] for many targets: entry `i` is `samp_pre(ek, items[i].0, items[i].1)`, the same
+/// bytes, in the same order. Each call has its own seed and therefore its own coins, so the
+/// calls are independent. With the `parallel` feature they run on rayon's thread pool,
+/// otherwise one after the other.
+pub fn samp_pre_batch(
+    ek: &ExpandedKey,
+    items: &[(&RqPoly, &[u8; 32])],
+) -> Vec<Result<Preimage, Error>> {
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
+        items
+            .par_iter()
+            .map(|&(t, seed)| samp_pre(ek, t, seed))
+            .collect()
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        items
+            .iter()
+            .map(|&(t, seed)| samp_pre(ek, t, seed))
+            .collect()
+    }
+}
+
 /// One SampPre attempt with an explicit PRNG: `None` if $`\|s\|^2>\lfloor\beta^2\rfloor`$ (or
 /// if the rounding guard trips, which a valid key never does).
 ///
@@ -118,7 +143,7 @@ pub fn samp_pre_with<S: LeafSampler>(
     let n = params.n();
     let (b00, b01, b10, b11) = ek.basis_parts();
 
-    // Scratch: t0, t1, then 2n values for ffSampling (later tx, ty).
+    // Scratch: t0, t1, then 2n values for ffSampling.
     let mut buf = vec![0.0f64; 4 * n];
     let (t0, rest) = buf.split_at_mut(n);
     let (t1, tmp) = rest.split_at_mut(n);
@@ -128,29 +153,13 @@ pub fn samp_pre_with<S: LeafSampler>(
         *x = c as f64;
     }
     fft(logn, t0);
-    t1.copy_from_slice(t0);
-    poly_mul_fft(logn, t1, b01);
-    poly_mulconst(logn, t1, -params.inv_q);
-    poly_mul_fft(logn, t0, b11);
-    poly_mulconst(logn, t0, params.inv_q);
+    poly_target_fft(logn, t0, t1, b01, b11, params.inv_q);
 
     // Sampling (lib.rs:651).
     ffsampling(sampler, logn, t0, t1, &ek.tree, tmp);
 
     // Lattice point v = z B (lib.rs:673-689): v0 = z0 b00 + z1 b10, v1 = z0 b01 + z1 b11.
-    {
-        let (tx, ty) = tmp.split_at_mut(n);
-        tx.copy_from_slice(t0);
-        ty.copy_from_slice(t1);
-        poly_mul_fft(logn, tx, b00);
-        poly_mul_fft(logn, ty, b10);
-        poly_add(logn, tx, ty);
-        ty.copy_from_slice(t0);
-        poly_mul_fft(logn, ty, b01);
-        t0.copy_from_slice(tx);
-        poly_mul_fft(logn, t1, b11);
-        poly_add(logn, t1, ty);
-    }
+    poly_lattice_point_fft(logn, t0, t1, (b00, b01, b10, b11));
     ifft(logn, t0);
     ifft(logn, t1);
 
@@ -300,5 +309,32 @@ mod tests {
             let wrong = RqPoly::from_coeffs(&params, &c).unwrap();
             assert!(!verify(&pk, &wrong, &s, u64::MAX), "case {k}");
         }
+    }
+
+    /// `samp_pre_batch` returns, entry by entry, what `samp_pre` returns for the same target and
+    /// seed (with or without the `parallel` feature), errors included and in place.
+    #[test]
+    fn samp_pre_batch_equals_samp_pre() {
+        let params = crate::Params::PCS;
+        let (_, sk) = crate::trapgen(&params, &[0x62; 32]).unwrap();
+        let ek = ExpandedKey::new(&sk).unwrap();
+        let mut targets: Vec<RqPoly> = (0..9u32)
+            .map(|i| {
+                let c: Vec<u32> = (0..params.n() as u32)
+                    .map(|j| (j * 7919 + i * 104729) % params.q)
+                    .collect();
+                RqPoly::from_coeffs(&params, &c).unwrap()
+            })
+            .collect();
+        // An element of another ring: Error::Mismatch, in its slot.
+        targets[4] = RqPoly::from_coeffs(&crate::Params::FALCON_1024, &[1u32; 1024]).unwrap();
+        let seeds: Vec<[u8; 32]> = (0..9u8).map(|i| [i ^ 0xa5; 32]).collect();
+        let items: Vec<(&RqPoly, &[u8; 32])> = targets.iter().zip(seeds.iter()).collect();
+        let batch = samp_pre_batch(&ek, &items);
+        assert_eq!(batch.len(), items.len());
+        for (i, (got, &(t, seed))) in batch.iter().zip(items.iter()).enumerate() {
+            assert_eq!(got, &samp_pre(&ek, t, seed), "item {i}");
+        }
+        assert_eq!(batch[4], Err(Error::Mismatch));
     }
 }

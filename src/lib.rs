@@ -44,6 +44,10 @@
 //!   fast-Fourier sampling in native `f64`, $`s=(s_0,s_1)`$ with $`s_0+h\,s_1=t\bmod q`$ and
 //!   $`\|s\|^2\le\lfloor\beta^2\rfloor`$.
 //! - [`verify`]: the norm bound and the linear relation (a product with the prepared $`h`$).
+//! - Throughput helpers with the same outputs: [`trapgen_expanded`] (the key pair and its
+//!   expanded key, built once), [`samp_pre_batch`] (many targets, on all cores with the
+//!   `parallel` feature), [`PreparedRqPoly::sum_of_products`] and
+//!   [`PreparedRqPoly::mul_ternary`].
 //! - Key encodings: [`PublicKey::to_bytes`], [`SecretKey::to_bytes`] and their inverses.
 //!
 //! ## Conventions
@@ -75,8 +79,9 @@
 //! scans, a Bernoulli test scaled by $`\sigma_{\min}/\sigma'`$), but native `f64` arithmetic,
 //! the rejection loops and key generation (binary-search CDT, big-integer NTRUSolve) are
 //! variable time. The ring arithmetic uses masks; the inverse reveals only whether an element is
-//! a unit. Secret keys, expanded keys, PRNG states and preimages are wiped on drop; NTRUSolve's
-//! big integers are not (num-bigint cannot wipe its buffers).
+//! a unit. [`PreparedRqPoly::mul_ternary`] also reveals whether its operand is ternary. Secret
+//! keys, expanded keys, PRNG states and preimages are wiped on drop; NTRUSolve's big integers
+//! are not (num-bigint cannot wipe its buffers).
 //!
 //! ## Credits
 //!
@@ -106,11 +111,13 @@ mod keygen;
 
 pub use error::Error;
 pub use ffsamp::ExpandedKey;
-pub use keygen::{KeygenReject, KeygenStats, trapgen, trapgen_from_fg, trapgen_with_stats};
+pub use keygen::{
+    KeygenReject, KeygenStats, trapgen, trapgen_expanded, trapgen_from_fg, trapgen_with_stats,
+};
 pub use keys::{PublicKey, SecretKey};
 pub use params::{BaseSampler, Params};
 pub use poly::{Preimage, PreparedRqPoly, RqPoly};
-pub use sign::{samp_pre, verify};
+pub use sign::{samp_pre, samp_pre_batch, verify};
 
 /// Low-level building blocks for tests, benchmarks and the fn-dsa parity harness.
 ///

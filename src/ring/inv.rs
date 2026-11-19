@@ -45,18 +45,22 @@ impl Drop for Level {
     }
 }
 
-/// In the NTT domain of size $`h=2^{\mathrm{logh}}\ge2`$: `e <- e^2 - y o^2`. Output $`2i`$ is
-/// evaluated at $`\zeta_i`$ and output $`2i+1`$ at $`-\zeta_i`$, $`\zeta_i`$ = `gm[h/2 + i]` (see
-/// the `ntt` module documentation).
+/// In the NTT domain of size $`h=2^{\mathrm{logh}}\ge2`$: `e <- (e^2 - y o^2) / h`, the input of
+/// the inverse NTT [`NttPrime::intt_n`] (which multiplies by $`h`$). Output $`2i`$ is evaluated at
+/// $`\zeta_i`$ and output $`2i+1`$ at $`-\zeta_i`$, $`\zeta_i`$ = `gm[h/2 + i]` (see the `ntt`
+/// module documentation).
 fn norm_ntt(pr: &NttPrime, logh: u32, e: &[u32], o: &[u32]) -> Vec<u32> {
     let h = 1usize << logh;
     let mut out = vec![0u32; h];
+    // mmul(mmul(a, b), c) = ab / h: the plain product with 1/h folded in (`NttPrime::mul` uses
+    // 2^64 mod p here).
+    let c = pr.ninv_r2[logh as usize];
     for i in 0..h / 2 {
         let z = pr.gm[h / 2 + i]; // Montgomery form of zeta_i
         for (k, sign_plus) in [(2 * i, false), (2 * i + 1, true)] {
-            let e2 = pr.mul(e[k], e[k]);
-            let o2 = pr.mul(o[k], o[k]);
-            let zo2 = pr.mmul(o2, z); // zeta_i * o^2, plain
+            let e2 = pr.mmul(pr.mmul(e[k], e[k]), c);
+            let o2 = pr.mmul(pr.mmul(o[k], o[k]), c);
+            let zo2 = pr.mmul(o2, z); // zeta_i * o^2 / h, plain
             // At -zeta_i: e^2 - (-zeta_i) o^2 = e^2 + zeta_i o^2.
             out[k] = if sign_plus {
                 mp_add(e2, zo2, pr.p)
@@ -82,8 +86,8 @@ fn descend(mq: &ModQ, logh: u32, a: &[u32]) -> (Vec<u32>, Level) {
     P2.ntt(logh, &mut o2);
     let mut n1 = norm_ntt(&P1, logh, &e1, &o1);
     let mut n2 = norm_ntt(&P2, logh, &e2, &o2);
-    P1.intt(logh, &mut n1);
-    P2.intt(logh, &mut n2);
+    P1.intt_n(logh, &mut n1);
+    P2.intt_n(logh, &mut n2);
     let norm: Vec<u32> = n1
         .iter()
         .zip(n2.iter())
@@ -198,14 +202,14 @@ pub(crate) fn invert(logn: u32, q: u32, a: &[u32]) -> Option<Vec<u32>> {
         let mut po1 = lvl.o1.clone();
         let mut pe2 = lvl.e2.clone();
         let mut po2 = lvl.o2.clone();
-        P1.pointwise_mul(&mut pe1, &i1);
-        P1.pointwise_mul(&mut po1, &i1);
-        P2.pointwise_mul(&mut pe2, &i2);
-        P2.pointwise_mul(&mut po2, &i2);
-        P1.intt(logh, &mut pe1);
-        P1.intt(logh, &mut po1);
-        P2.intt(logh, &mut pe2);
-        P2.intt(logh, &mut po2);
+        P1.pointwise_mul_div_n(logh, &mut pe1, &i1);
+        P1.pointwise_mul_div_n(logh, &mut po1, &i1);
+        P2.pointwise_mul_div_n(logh, &mut pe2, &i2);
+        P2.pointwise_mul_div_n(logh, &mut po2, &i2);
+        P1.intt_n(logh, &mut pe1);
+        P1.intt_n(logh, &mut po1);
+        P2.intt_n(logh, &mut pe2);
+        P2.intt_n(logh, &mut po2);
         let mut out = vec![0u32; 2 * h];
         for i in 0..h {
             out[2 * i] = mq.crt(pe1[i], pe2[i]);

@@ -738,3 +738,28 @@ fn profile_xgcd_against_num_integer() {
         b.bits()
     );
 }
+
+/// `trapgen_expanded` returns the key pair of `trapgen` for the same seed and, bit for bit, the
+/// expanded key of `ExpandedKey::new` on its secret key (basis, tree, key identifier, leaf
+/// range), at both presets.
+#[test]
+fn trapgen_expanded_equals_trapgen_then_expand() {
+    for params in [Params::PCS, Params::FALCON_1024] {
+        for s in 0..2u8 {
+            let seed = [s ^ 0x5a; 32];
+            let (pk, sk) = crate::trapgen(&params, &seed).unwrap();
+            let ek = crate::ExpandedKey::new(&sk).unwrap();
+            let (pk2, sk2, ek2) = crate::trapgen_expanded(&params, &seed).unwrap();
+            assert!(pk == pk2);
+            assert_eq!(
+                (&sk.f, &sk.g, &sk.big_f, &sk.big_g),
+                (&sk2.f, &sk2.g, &sk2.big_f, &sk2.big_g)
+            );
+            let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<u64>>();
+            assert_eq!(bits(&ek.basis), bits(&ek2.basis));
+            assert_eq!(bits(&ek.tree), bits(&ek2.tree));
+            assert_eq!(ek.key_id, ek2.key_id);
+            assert_eq!(ek.leaf_sigma_range(), ek2.leaf_sigma_range());
+        }
+    }
+}

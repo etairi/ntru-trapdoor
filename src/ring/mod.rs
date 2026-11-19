@@ -11,6 +11,10 @@
 //!   every degree $`2^k\le1024`$ (the norm tower needs all of them).
 //! - **Prepared products**: [`RqPoly::prepare`] keeps the NTT residues of a fixed operand, so
 //!   that [`PreparedRqPoly::mul`] needs four NTTs instead of six (Verify uses it for $`h`$).
+//!   [`PreparedRqPoly::sum_of_products`] adds products in the NTT domain (one inverse NTT per
+//!   prime for many terms), and [`PreparedRqPoly::mul_ternary`] computes a product with a
+//!   ternary operand modulo one prime when the ring allows it. Both equal the sums and products
+//!   of [`PreparedRqPoly::mul`].
 //! - **Inversion and invertibility** (`inv`): the norm tower
 //!   $`a^{-1}(x)=a(-x)\,N(a)^{-1}(x^2)`$ with $`N(a)(y)=a_e(y)^2-y\,a_o(y)^2`$, down to a scalar
 //!   inverted by Fermat ($`a^{q-2}`$, with an extended-Euclid fallback that makes it exact for a
@@ -23,7 +27,8 @@
 //!
 //! Side channels: addition, subtraction, negation, multiplication and the norm tower use masks
 //! instead of branches; their running time depends on the degree only. `inverse` returns
-//! `None` for a non-unit, which is the only value-dependent outcome.
+//! `None` for a non-unit, which is the only value-dependent outcome. `mul_ternary` takes its
+//! fast path only for a ternary operand, so its time reveals whether the operand is ternary.
 //!
 //! Used by key generation and the tests: the inherent methods and the operator
 //! impls below.
@@ -101,6 +106,7 @@ impl RqPoly {
             logn,
             r1,
             r2,
+            rc1: std::sync::OnceLock::new(),
         }
     }
 
@@ -158,6 +164,62 @@ impl PreparedRqPoly {
         let mut c = vec![0u32; other.c.len()];
         ntt::mul_prepared_mod_q(self.logn, self.q, &self.r1, &self.r2, &other.c, &mut c);
         RqPoly::from_raw(self.q, c)
+    }
+
+    /// `a * t` in $`R_q`$ for the prepared `a` and a ternary `t` (every coefficient $`0`$, $`1`$ or
+    /// $`q-1`$), exactly; equal to [`PreparedRqPoly::mul`].
+    ///
+    /// With `a` lifted to centred values ($`|a_i|\le\lfloor q/2\rfloor`$), the integer
+    /// coefficients of $`a\,t`$ are at most $`d\lfloor q/2\rfloor`$ in absolute value. When
+    /// $`2d\lfloor q/2\rfloor<p_1`$ (up to about $`q=2^{21}`$ at $`d=1024`$, both presets
+    /// included), the product is therefore computed modulo the single NTT prime $`p_1`$: two
+    /// NTTs instead of four, and no CRT. The centred residues are built from the prepared ones
+    /// on the first such call (two NTTs, once) and kept. For larger $`q`$, or a `t` that is not
+    /// ternary, this is [`PreparedRqPoly::mul`]. The test of `t` uses masks, so the running time
+    /// reveals only whether `t` is ternary. Panics if the modulus or the degree differ.
+    pub fn mul_ternary(&self, t: &RqPoly) -> RqPoly {
+        assert!(
+            self.q == t.q && self.n() == t.c.len(),
+            "PreparedRqPoly: modulus or degree mismatch"
+        );
+        if !ntt::ternary_fits_p1(self.logn, self.q) || !ntt::is_ternary(self.q, &t.c) {
+            return self.mul(t);
+        }
+        let ac1 = self
+            .rc1
+            .get_or_init(|| ntt::centred_p1_from_prepared(self.logn, self.q, &self.r1));
+        let mut c = vec![0u32; t.c.len()];
+        ntt::mul_ternary_p1_mod_q(self.logn, self.q, ac1, &t.c, &mut c);
+        RqPoly::from_raw(self.q, c)
+    }
+
+    /// $`\sum_i a_i\,b_i`$ in $`R_q`$ for prepared $`a_i`$, exactly; equal to adding the products
+    /// [`PreparedRqPoly::mul`] modulo $`q`$ (a difference takes negated operands,
+    /// [`RqPoly::neg`]).
+    ///
+    /// The pointwise products are added in the NTT domain, so the sum needs two forward NTTs
+    /// per term, but only two inverse NTTs and one CRT per block of terms: a block holds as many
+    /// terms as the CRT range allows (2,047 at $`d=1024`$, $`q=1048573`$, and at least one for
+    /// every ring). Panics if `terms` is empty or if the moduli or the degrees differ.
+    pub fn sum_of_products(terms: &[(&PreparedRqPoly, &RqPoly)]) -> RqPoly {
+        let (a0, _) = terms
+            .first()
+            .expect("PreparedRqPoly::sum_of_products: no terms");
+        let (q, logn) = (a0.q, a0.logn);
+        let n = 1usize << logn;
+        for (a, b) in terms {
+            assert!(
+                a.q == q && a.logn == logn && b.q == q && b.c.len() == n,
+                "PreparedRqPoly: modulus or degree mismatch"
+            );
+        }
+        let parts: Vec<(&[u32], &[u32], &[u32])> = terms
+            .iter()
+            .map(|(a, b)| (&a.r1[..], &a.r2[..], &b.c[..]))
+            .collect();
+        let mut c = vec![0u32; n];
+        ntt::sum_of_prepared_products_mod_q(logn, q, &parts, &mut c);
+        RqPoly::from_raw(q, c)
     }
 }
 
@@ -526,5 +588,119 @@ mod tests {
         let mut bad = enc.clone();
         bad[2] |= 0x80;
         assert_eq!(RqPoly::from_bytes(&toy, &bad), Err(Error::InvalidEncoding));
+    }
+
+    fn rand_ternary(rng: &mut Shake256Prng, q: u32, n: usize) -> RqPoly {
+        let c = (0..n)
+            .map(|_| match rng.next_u8() % 3 {
+                0 => 0,
+                1 => 1,
+                _ => q - 1,
+            })
+            .collect();
+        RqPoly::from_raw(q, c)
+    }
+
+    /// `mul_ternary` equals `mul`: random ternary operands at every degree and test modulus
+    /// (including the largest, where one prime does not fit and it falls back), the extremes of
+    /// the single-prime bound (centred values +-floor(q/2) against all-ones and all-minus-ones,
+    /// so that a coefficient reaches d floor(q/2)), non-ternary operands (the fallback), and a
+    /// second call (the cached centred residues).
+    #[test]
+    fn mul_ternary_equals_mul() {
+        for &q in QS.iter() {
+            for logn in 1..=10u32 {
+                let n = 1usize << logn;
+                let mut rng = Shake256Prng::from_parts(&[b"tern", &q.to_le_bytes(), &[logn as u8]]);
+                let a = rand_poly(&mut rng, q, n);
+                let ap = a.prepare();
+                for _ in 0..3 {
+                    let t = rand_ternary(&mut rng, q, n);
+                    assert_eq!(ap.mul_ternary(&t), ap.mul(&t), "q {q} logn {logn}");
+                }
+                let t = rand_ternary(&mut rng, q, n);
+                assert_eq!(
+                    ap.mul_ternary(&t),
+                    ap.mul(&t),
+                    "second call, q {q} logn {logn}"
+                );
+                let b = rand_poly(&mut rng, q, n);
+                assert_eq!(
+                    ap.mul_ternary(&b),
+                    ap.mul(&b),
+                    "non-ternary, q {q} logn {logn}"
+                );
+                for av in [q / 2, q - q / 2] {
+                    let ext = RqPoly::from_raw(q, vec![av; n]).prepare();
+                    for tv in [1, q - 1] {
+                        let t = RqPoly::from_raw(q, vec![tv; n]);
+                        assert_eq!(ext.mul_ternary(&t), ext.mul(&t), "extreme, q {q} {logn}");
+                    }
+                }
+            }
+        }
+        // The cache changes neither equality nor clones.
+        let q = 1048573;
+        let mut rng = Shake256Prng::new(b"tern-eq");
+        let a = rand_poly(&mut rng, q, 1024);
+        let (p1, p2) = (a.prepare(), a.prepare());
+        let t = rand_ternary(&mut rng, q, 1024);
+        let _ = p1.mul_ternary(&t);
+        assert!(p1.rc1.get().is_some() && p2.rc1.get().is_none());
+        assert_eq!(p1, p2);
+        assert_eq!(p1.clone().mul_ternary(&t), p2.mul(&t));
+        assert!(ntt::ternary_fits_p1(10, 1048573) && ntt::ternary_fits_p1(10, 12289));
+        assert!(!ntt::ternary_fits_p1(10, 33554393));
+    }
+
+    /// `sum_of_products` equals the sum of the `mul` products: 1, 2 and 5 terms at every test
+    /// modulus (at the largest one, one term per CRT block, so the blocks are exercised), the
+    /// extreme operands (all q - 1), and 2,049 terms at d = 1024, q = 1048573 (two blocks:
+    /// 2,047 + 2).
+    #[test]
+    fn sum_of_products_equals_sum_of_muls() {
+        for &q in QS.iter() {
+            for logn in [1u32, 2, 5, 9, 10] {
+                let n = 1usize << logn;
+                let mut rng = Shake256Prng::from_parts(&[b"sum", &q.to_le_bytes(), &[logn as u8]]);
+                for k in [1usize, 2, 5] {
+                    let a: Vec<PreparedRqPoly> = (0..k)
+                        .map(|_| rand_poly(&mut rng, q, n).prepare())
+                        .collect();
+                    let b: Vec<RqPoly> = (0..k).map(|_| rand_poly(&mut rng, q, n)).collect();
+                    let terms: Vec<(&PreparedRqPoly, &RqPoly)> = a.iter().zip(b.iter()).collect();
+                    let want = terms
+                        .iter()
+                        .fold(RqPoly::from_raw(q, vec![0; n]), |acc, (x, y)| {
+                            acc.add(&x.mul(y))
+                        });
+                    assert_eq!(
+                        PreparedRqPoly::sum_of_products(&terms),
+                        want,
+                        "q {q} {logn} {k}"
+                    );
+                }
+                let m = RqPoly::from_raw(q, vec![q - 1; n]);
+                let mp = m.prepare();
+                let terms = vec![(&mp, &m); 3];
+                let want = mp.mul(&m).add(&mp.mul(&m)).add(&mp.mul(&m));
+                assert_eq!(
+                    PreparedRqPoly::sum_of_products(&terms),
+                    want,
+                    "extreme q {q}"
+                );
+            }
+        }
+        assert_eq!(ntt::max_sum_terms(10, 1048573), 2047);
+        assert_eq!(ntt::max_sum_terms(10, 33554393), 1);
+        let (q, n) = (1048573u32, 1024usize);
+        let mut rng = Shake256Prng::new(b"sum-blocks");
+        let a = RqPoly::from_raw(q, vec![q - 1; n]).prepare();
+        let b: Vec<RqPoly> = (0..2049).map(|_| rand_poly(&mut rng, q, n)).collect();
+        let terms: Vec<(&PreparedRqPoly, &RqPoly)> = b.iter().map(|x| (&a, x)).collect();
+        let want = b
+            .iter()
+            .fold(RqPoly::from_raw(q, vec![0; n]), |acc, y| acc.add(&a.mul(y)));
+        assert_eq!(PreparedRqPoly::sum_of_products(&terms), want, "2049 terms");
     }
 }

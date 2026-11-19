@@ -43,6 +43,9 @@ later (edition 2024).
 ntru-trapdoor = "0.1"
 ```
 
+The optional `parallel` feature runs `samp_pre_batch` on all cores, through rayon:
+`ntru-trapdoor = { version = "0.1", features = ["parallel"] }`.
+
 The crate forbids `unsafe` code. Its only dependencies are `zeroize` and, for key generation,
 `num-bigint`, `num-integer` and `num-traits`.
 
@@ -76,12 +79,14 @@ fn main() -> Result<(), Error> {
 |---|---|
 | `Params` | A parameter set: the presets `Params::PCS` and `Params::FALCON_1024`, or your own `(d, q, widths)` |
 | `trapgen(params, seed)` | A key pair `(PublicKey, SecretKey)` |
+| `trapgen_expanded(params, seed)` | The key pair and its `ExpandedKey`, built once |
 | `PublicKey` | `h = g/f mod q`, so that `A = [1 \| h]` |
 | `SecretKey` | The trapdoor `(f, g, F, G)` with `fG − gF = q`; wiped on drop |
 | `ExpandedKey::new(&sk)` | The FFT basis and the sampling tree, built once per key; `Send + Sync` |
 | `samp_pre(&ek, &t, &seed)` | A short preimage `s` of `t`, for a fresh seed per call |
+| `samp_pre_batch(&ek, &items)` | `samp_pre` for many `(t, seed)` pairs, on all cores with the `parallel` feature |
 | `verify(&pk, &t, &s, beta_sq)` | The norm bound and the linear relation |
-| `RqPoly`, `PreparedRqPoly` | Elements of `R_q`: exact `mul`, `inverse`, `is_invertible`, canonical encodings |
+| `RqPoly`, `PreparedRqPoly` | Elements of `R_q`: exact `mul`, `inverse`, `is_invertible`, canonical encodings, and for a prepared operand `mul_ternary` and `sum_of_products` |
 
 Errors are values of `Error`. The crate documentation gives the details.
 
@@ -111,21 +116,21 @@ measurements and the estimates.
 
 ## Performance
 
-Indicative medians on an Apple M4, one thread, rustc 1.99.0, release profile, with other
-applications running. [Testing and benchmarks](docs/testing.md) has the full table and the
-setup.
+Indicative medians on an Apple M4, one thread, rustc 1.100.0, release profile, with other
+applications running. [Testing and benchmarks](docs/testing.md) has the full tables, an Intel
+Xeon (x86-64) table and the setup.
 
 | Operation | PCS | Falcon-1024 |
 |---|---|---|
-| key generation (`trapgen`) | 5.9 ms | 4.1 ms |
-| sampling tree (`ExpandedKey::new`) | 52 µs | 52 µs |
-| preimage (`samp_pre`) | 161 µs | 194 µs |
-| `verify` | 21 µs | 21 µs |
-| `R_q` multiplication / inversion | 28 µs / 58 µs | 28 µs / 58 µs |
+| key generation (`trapgen`) | 6.0 ms | 4.2 ms |
+| sampling tree (`ExpandedKey::new`) | 53 µs | 53 µs |
+| preimage (`samp_pre`) | 146 µs | 186 µs |
+| `verify` | 20 µs | 20 µs |
+| `R_q` multiplication / inversion | 28 µs / 58 µs | 27 µs / 56 µs |
 
-For comparison, fn-dsa 0.4.0 signs a Falcon-1024 message in 210 µs on the same machine. Sampling
-scales with threads that share one key: about 25,000 preimages per second on 8 threads at the PCS
-set.
+For comparison, fn-dsa 0.4.0 signs a Falcon-1024 message in 211 µs on the same machine. Sampling
+scales with threads that share one key: about 27,000 preimages per second on 8 threads at
+`Params::PCS`.
 
 ## Documentation
 

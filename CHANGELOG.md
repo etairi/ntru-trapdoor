@@ -4,6 +4,42 @@ All notable changes to this crate. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the crate follows
 [Semantic Versioning](https://semver.org/).
 
+## [0.1.2] - 2026-11-19
+
+Faster, with the same outputs: for the same inputs and seeds, every key, preimage, product and
+encoding is the same bytes as in 0.1.1. The known-answer tests and the fn-dsa parity tests pass
+unchanged, so the seed label stays `ntru-trapdoor/v1/samp-pre`.
+
+### Added
+
+- `PreparedRqPoly::mul_ternary`: the product with a ternary operand (coefficients 0, 1 and
+  q − 1), computed modulo a single NTT prime when 2d⌊q/2⌋ is below that prime (q up to about
+  2^21 at d = 1024, both presets included). Equal to `PreparedRqPoly::mul`. Its running time
+  reveals whether the operand is ternary.
+- `PreparedRqPoly::sum_of_products`: a sum of products with prepared operands, added in the NTT
+  domain, so that each block of terms needs one inverse NTT per prime and one CRT. Equal to
+  adding the products.
+- `trapgen_expanded`: `trapgen` that also returns the `ExpandedKey` that its leaf check builds,
+  the one `ExpandedKey::new` builds from the new key.
+- `samp_pre_batch`: `samp_pre` for many targets and seeds, with the same results entry by entry.
+- The `parallel` feature, off by default, with the optional dependency `rayon`.
+  `samp_pre_batch` then runs on rayon's thread pool.
+
+### Changed
+
+- SampPre is faster: by 6 to 8 % on an Intel Xeon 8581C and by 8 to 12 % on an Apple M4, at both
+  presets.
+  - The SHAKE256 reads inline into the sampler. A read across a block boundary copies the bytes
+    on each side instead of reading them one at a time.
+  - ffSampling runs the work between its two recursive calls as one pass, and SampPre computes
+    its target and its lattice point in one pass each, with the same IEEE operations on each
+    value as before.
+- Products in `R_q` are faster, by about 12 % on the Xeon (Verify and the inversion by 10 %) and by
+  3 to 9 % on the M4. The inverse NTT no longer halves at every layer, and the factor 1/n moves
+  into the pointwise product. Prepared operands are stored scaled, so that a prepared product
+  needs one Montgomery multiplication per point instead of two. The NTT layers run over
+  fixed-size blocks, with the two smallest layers merged.
+
 ## [0.1.1] - 2026-11-02
 
 Documentation only: the code does not change.

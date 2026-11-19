@@ -40,7 +40,7 @@ mod tests;
 pub(crate) use trapgen::fits_width;
 
 use crate::prng::Prng;
-use crate::{Error, Params, PublicKey, SecretKey};
+use crate::{Error, ExpandedKey, Params, PublicKey, SecretKey};
 
 #[cfg(doc)]
 use crate::RqPoly;
@@ -93,6 +93,18 @@ pub struct KeygenStats {
 /// `params.keygen_max_attempts` candidates.
 pub fn trapgen(params: &Params, seed: &[u8; 32]) -> Result<(PublicKey, SecretKey), Error> {
     trapgen::trapgen_with_stats(params, seed).map(|(pk, sk, _)| (pk, sk))
+}
+
+/// [`trapgen`], also returning the expanded key: the same key pair, and the same
+/// [`ExpandedKey`] as [`ExpandedKey::new`] on the secret key, without building it twice (key
+/// generation builds it for its leaf check; about 54 µs at d = 1024 on an Apple M4).
+///
+/// Errors: as [`trapgen`].
+pub fn trapgen_expanded(
+    params: &Params,
+    seed: &[u8; 32],
+) -> Result<(PublicKey, SecretKey, ExpandedKey), Error> {
+    trapgen::trapgen_full(params, seed).map(|(pk, sk, ek, _)| (pk, sk, ek))
 }
 
 /// [`trapgen`], also returning the rejection counters (for tests and benchmarks).

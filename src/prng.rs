@@ -623,6 +623,12 @@ impl Shake256Prng {
 
     /// Squeezes the next block into the buffer (shake.rs:697-702: `extract` of 136 bytes is
     /// one permutation followed by a copy of the rate, since the rate is 136 bytes).
+    ///
+    /// The refill and the two block-boundary paths below are out of line and marked cold, so
+    /// that the read paths stay small enough to inline into the sampler: the stream and the
+    /// read positions are unchanged, only the code layout differs (SampPre 7 % faster on an
+    /// Apple M4, 2026-11-18 study).
+    #[cold]
     #[inline(never)]
     fn refill(&mut self) {
         keccak_f1600(&mut self.state);
@@ -632,11 +638,41 @@ impl Shake256Prng {
         }
         self.ptr = 0;
     }
+
+    /// The next `N <= 8` bytes when fewer than `N` are left in the block (fn-dsa reads them
+    /// byte by byte, shake.rs:724-727 and :735-741): the `k` bytes left, then a refill, then
+    /// the other `N - k`. The same bytes in the same order.
+    #[inline(always)]
+    fn read_across<const N: usize>(&mut self) -> [u8; N] {
+        let mut b = [0u8; N];
+        let k = RATE - self.ptr;
+        debug_assert!(k < N);
+        b[..k].copy_from_slice(&self.buf[self.ptr..]);
+        self.refill();
+        b[k..].copy_from_slice(&self.buf[..N - k]);
+        self.ptr = N - k;
+        b
+    }
+
+    /// [`Prng::next_u16`] across a block boundary.
+    #[cold]
+    #[inline(never)]
+    fn next_u16_slow(&mut self) -> u16 {
+        u16::from_le_bytes(self.read_across::<2>())
+    }
+
+    /// [`Prng::next_u64`] across a block boundary (about 5 % of the calls in SampPre, where
+    /// one-byte reads leave the position unaligned).
+    #[cold]
+    #[inline(never)]
+    fn next_u64_slow(&mut self) -> u64 {
+        u64::from_le_bytes(self.read_across::<8>())
+    }
 }
 
 impl Prng for Shake256Prng {
     /// shake.rs:713-720.
-    #[inline]
+    #[inline(always)]
     fn next_u8(&mut self) -> u8 {
         if self.ptr == RATE {
             self.refill();
@@ -647,11 +683,10 @@ impl Prng for Shake256Prng {
     }
 
     /// shake.rs:722-731.
-    #[inline]
+    #[inline(always)]
     fn next_u16(&mut self) -> u16 {
         if self.ptr >= RATE - 1 {
-            let x = self.next_u8() as u16;
-            return x | ((self.next_u8() as u16) << 8);
+            return self.next_u16_slow();
         }
         let x = u16::from_le_bytes([self.buf[self.ptr], self.buf[self.ptr + 1]]);
         self.ptr += 2;
@@ -659,14 +694,10 @@ impl Prng for Shake256Prng {
     }
 
     /// shake.rs:733-745.
-    #[inline]
+    #[inline(always)]
     fn next_u64(&mut self) -> u64 {
         if self.ptr >= RATE - 7 {
-            let mut x = 0u64;
-            for i in 0..8 {
-                x |= (self.next_u8() as u64) << (i << 3);
-            }
-            return x;
+            return self.next_u64_slow();
         }
         let mut b = [0u8; 8];
         b.copy_from_slice(&self.buf[self.ptr..self.ptr + 8]);

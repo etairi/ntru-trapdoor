@@ -14,7 +14,9 @@ use fn_dsa::{
 };
 use fn_dsa_comm::codec::trim_i8_decode;
 use ntru_trapdoor::hazmat::{LeafSampler, Prng, SamplerZ, Shake256Prng, fft, ifft};
-use ntru_trapdoor::{ExpandedKey, Params, PublicKey, RqPoly, SecretKey, samp_pre, verify};
+use ntru_trapdoor::{
+    ExpandedKey, Params, PreparedRqPoly, PublicKey, RqPoly, SecretKey, samp_pre, verify,
+};
 
 /// The first PCS fixture key: (secret key, public key).
 fn pcs_key(params: &Params) -> (SecretKey, PublicKey) {
@@ -134,6 +136,94 @@ fn bench_ring(c: &mut Criterion) {
     g.bench_function("encode/pcs", |bch| bch.iter(|| black_box(&a).to_bytes()));
     g.bench_function("decode/pcs", |bch| {
         bch.iter(|| RqPoly::from_bytes(&params, black_box(&enc)))
+    });
+    g.finish();
+}
+
+/// A ternary element (coefficients 0, 1, q - 1).
+fn rand_ternary(params: &Params, rng: &mut Shake256Prng) -> RqPoly {
+    let c: Vec<u32> = (0..params.n())
+        .map(|_| match rng.next_u8() % 3 {
+            0 => 0,
+            1 => 1,
+            _ => params.q - 1,
+        })
+        .collect();
+    RqPoly::from_coeffs(params, &c).unwrap()
+}
+
+/// A small element (coefficients in [-600, 600]), of the size of a preimage half.
+fn rand_small(params: &Params, rng: &mut Shake256Prng) -> RqPoly {
+    let c: Vec<i32> = (0..params.n())
+        .map(|_| (rng.next_u16() % 1201) as i32 - 600)
+        .collect();
+    RqPoly::from_i32(params, &c).unwrap()
+}
+
+/// Sums of products with prepared operands at d = 1024, q = 1048573: four products with
+/// ternary operands (`sum_ternary_4`), and a small element plus a product with a small operand
+/// minus four products with ternary operands (`sum_mixed_5`). `separate` computes each product
+/// with `PreparedRqPoly::mul` and adds the results.
+fn bench_product_sums(c: &mut Criterion) {
+    let params = Params::PCS;
+    let mut rng = Shake256Prng::new(b"bench-product-sums");
+    let a0 = rand_poly(&params, &mut rng).prepare();
+    let a: Vec<_> = (0..3)
+        .map(|_| rand_poly(&params, &mut rng).prepare())
+        .collect();
+    let h = rand_poly(&params, &mut rng).prepare();
+    let t0 = rand_ternary(&params, &mut rng);
+    let t: Vec<RqPoly> = (0..3).map(|_| rand_ternary(&params, &mut rng)).collect();
+    let s0 = rand_small(&params, &mut rng);
+    let s1 = rand_small(&params, &mut rng);
+    let ternary_separate = || {
+        let mut acc = a0.mul(black_box(&t0));
+        for (b, x) in a.iter().zip(t.iter()) {
+            acc = acc.add(&b.mul(black_box(x)));
+        }
+        acc
+    };
+    let mut g = c.benchmark_group("ring");
+    g.bench_function("sum_ternary_4/separate", |bch| bch.iter(ternary_separate));
+    g.bench_function("sum_mixed_5/separate", |bch| {
+        bch.iter(|| s0.add(&h.mul(black_box(&s1))).sub(&ternary_separate()))
+    });
+    let ternary_single_prime = || {
+        let mut acc = a0.mul_ternary(black_box(&t0));
+        for (b, x) in a.iter().zip(t.iter()) {
+            acc = acc.add(&b.mul_ternary(black_box(x)));
+        }
+        acc
+    };
+    g.bench_function("mul_ternary/pcs", |bch| {
+        bch.iter(|| black_box(&a0).mul_ternary(black_box(&t0)))
+    });
+    g.bench_function("sum_ternary_4/mul_ternary", |bch| {
+        bch.iter(ternary_single_prime)
+    });
+    g.bench_function("sum_ternary_4/sum_of_products", |bch| {
+        bch.iter(|| {
+            let terms: Vec<(&PreparedRqPoly, &RqPoly)> = std::iter::once((&a0, &t0))
+                .chain(a.iter().zip(t.iter()))
+                .collect();
+            PreparedRqPoly::sum_of_products(black_box(&terms))
+        })
+    });
+    g.bench_function("sum_mixed_5/mul_ternary", |bch| {
+        bch.iter(|| s0.add(&h.mul(black_box(&s1))).sub(&ternary_single_prime()))
+    });
+    g.bench_function("sum_mixed_5/sum_of_products", |bch| {
+        bch.iter(|| {
+            let neg: Vec<RqPoly> = std::iter::once(&t0)
+                .chain(t.iter())
+                .map(|x| x.neg())
+                .collect();
+            let terms: Vec<(&PreparedRqPoly, &RqPoly)> = [(&h, &s1)]
+                .into_iter()
+                .chain(std::iter::once(&a0).chain(a.iter()).zip(neg.iter()))
+                .collect();
+            s0.add(&PreparedRqPoly::sum_of_products(black_box(&terms)))
+        })
     });
     g.finish();
 }
@@ -258,6 +348,7 @@ fn bench_expand_samppre_verify(c: &mut Criterion) {
 criterion_group!(
     group,
     bench_ring,
+    bench_product_sums,
     bench_fft,
     bench_prng,
     bench_sampler,

@@ -1,6 +1,6 @@
 [package]
 name = "ntru-trapdoor"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 # The MSRV of the PCS, Jali and the OpenVTC workspace, the intended consumers.
 rust-version = "1.95"
@@ -34,6 +34,13 @@ num-bigint = "0.4.8"
 # `Integer::extended_gcd` for BigInt, and the Zero/One/Signed/ToPrimitive traits.
 num-integer = "0.1.47"
 num-traits = "0.2.19"
+# Optional, for the `parallel` feature only (off by default): `samp_pre_batch` runs its calls on
+# rayon's thread pool, with the same outputs as without the feature.
+rayon = { version = "1.3", optional = true }
+
+[features]
+default = []
+parallel = ["dep:rayon"]
 
 [dev-dependencies]
 # Benchmarks (benches/sign.rs, benches/keygen.rs). Same major version as the PCS and Jali.

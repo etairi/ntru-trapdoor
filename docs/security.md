@@ -87,6 +87,8 @@ fn-dsa's). The following run in variable time:
 - key generation: the binary-search CDT, the candidate loop and the big-integer NTRUSolve.
 
 The ring arithmetic uses masks; `inverse` reveals only whether an element is a unit.
+`PreparedRqPoly::mul_ternary` also reveals whether its operand is ternary, because it takes a
+faster path then.
 
 ## Wiping
 

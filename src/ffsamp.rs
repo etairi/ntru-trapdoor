@@ -32,9 +32,11 @@
 //! ffSampling (`ffsampling`) mirrors fn-dsa's `ffsamp_fft_inner` (sampler.rs:505-635) with tree
 //! lookups instead of the LDL: leaf order at each `logn = 1` node is `t1[0], t1[1]`, then
 //! `t0[0], t0[1]` (fn-dsa's order). The product `(t1 - z1) * l10` is computed as
-//! `poly_mul_fft(w, l10)` instead of fn-dsa's `poly_mul_fft(l10, w)`: the same two IEEE products
-//! per component, combined by the same operation (a commuted addition for the imaginary part),
-//! hence bit-identical.
+//! `poly_mul_fft(w, l10)` would compute it, instead of fn-dsa's `poly_mul_fft(l10, w)`: the same
+//! two IEEE products per component, combined by the same operation (a commuted addition for the
+//! imaginary part), hence bit-identical. Between the two recursive calls of a node, the merge of
+//! `z1`, that product, the addition into `t0` and the split of the result run as one pass
+//! (`fft::merge_sub_mul_add_split`), with the operations of the separate steps on each value.
 //!
 //! [`ExpandedKey::new`] first runs [`SecretKey::validate`] unless the key is known valid (it
 //! came from key generation or [`SecretKey::from_bytes`]): an inconsistent trapdoor
@@ -47,8 +49,8 @@
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::fft::{
-    fft, poly_add, poly_ldl_fft, poly_merge_fft, poly_mul_fft, poly_muladj_fft, poly_mulownadj_fft,
-    poly_neg, poly_set_small, poly_split_fft, poly_split_selfadj_fft, poly_sub,
+    fft, merge_sub_mul_add_split, poly_add, poly_ldl_fft, poly_merge_fft, poly_muladj_fft,
+    poly_mulownadj_fft, poly_neg, poly_set_small, poly_split_fft, poly_split_selfadj_fft,
 };
 use crate::prng::shake256;
 use crate::sampler::LeafSampler;
@@ -362,32 +364,22 @@ pub(crate) fn ffsampling<S: LeafSampler>(
     let sub = tree_size(logn - 1);
     let (l10, rest) = tree.split_at(n);
     let (right, left) = rest.split_at(sub);
+    let (w, rest) = tmp.split_at_mut(n);
 
-    // Split t1, sample the right sub-tree, merge into z1 = tmp[n..2n] (sampler.rs:593-602).
+    // Split t1, sample the right sub-tree (sampler.rs:593-601).
     {
-        let (w0, rest) = tmp.split_at_mut(hn);
-        let (w1, rest) = rest.split_at_mut(hn);
+        let (w0, w1) = w.split_at_mut(hn);
         poly_split_fft(logn, w0, w1, t1);
         ffsampling(samp, logn - 1, w0, w1, right, rest);
-        poly_merge_fft(logn, &mut rest[..n], w0, w1);
     }
 
-    // tb0 = t0 + (t1 - z1) * l10 into t0; z1 into t1 (sampler.rs:604-620).
-    {
-        let (w, rest) = tmp.split_at_mut(n);
-        let z1 = &rest[..n];
-        w.copy_from_slice(&t1[..n]);
-        poly_sub(logn, w, z1);
-        t1[..n].copy_from_slice(z1);
-        poly_mul_fft(logn, w, l10);
-        poly_add(logn, t0, w);
-    }
+    // Merge z1 into t1, tb0 = t0 + (t1 - z1) * l10, split tb0 into (w0, w1)
+    // (sampler.rs:602-626), in one pass with the same operations.
+    merge_sub_mul_add_split(logn, w, t0, t1, l10);
 
-    // Split tb0, sample the left sub-tree, merge into t0 (sampler.rs:622-634).
+    // Sample the left sub-tree, merge into t0 (sampler.rs:627-634).
     {
-        let (w0, rest) = tmp.split_at_mut(hn);
-        let (w1, rest) = rest.split_at_mut(hn);
-        poly_split_fft(logn, w0, w1, t0);
+        let (w0, w1) = w.split_at_mut(hn);
         ffsampling(samp, logn - 1, w0, w1, left, rest);
         poly_merge_fft(logn, t0, w0, w1);
     }
