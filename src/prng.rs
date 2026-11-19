@@ -63,19 +63,13 @@ const RC: [u64; 24] = [
     0x8000000080008008,
 ];
 
-/// The Keccak-f\[1600\] permutation, in place.
-///
-/// Verbatim port of fn-dsa `KeccakState::process` (fn-dsa-comm/src/shake.rs:40-461): the
-/// lane-complementing representation, 24 rounds unrolled two per loop iteration.
-#[allow(
-    non_snake_case,
-    clippy::assign_op_pattern,
-    clippy::identity_op,
-    clippy::manual_rotate
-)]
+/// The body of the Keccak-f\[1600\] permutation, shared by [`keccak_f1600_portable`] and its
+/// copy compiled for BMI1 and BMI2 (the `simd` feature on x86-64): one source, two
+/// compilations, the same results.
 #[rustfmt::skip]
-fn keccak_f1600(state: &mut [u64; 25]) {
-    let mut A: [u64; 25] = *state;
+macro_rules! keccak_f1600_body {
+    ($state:ident) => {{
+    let mut A: [u64; 25] = *$state;
 
 
     // Invert some words (alternate internal representation, which
@@ -496,8 +490,52 @@ fn keccak_f1600(state: &mut [u64; 25]) {
     A[20] = !A[20];
 
 
-    *state = A;
+    *$state = A;
     A.zeroize();
+    }};
+}
+
+/// The Keccak-f\[1600\] permutation, in place.
+///
+/// Verbatim port of fn-dsa `KeccakState::process` (fn-dsa-comm/src/shake.rs:40-461): the
+/// lane-complementing representation, 24 rounds unrolled two per loop iteration. With the
+/// `simd` feature on x86-64 the same code compiled for BMI1 and BMI2 (`andn`, `rorx`) runs on
+/// processors that have them.
+#[inline]
+fn keccak_f1600(state: &mut [u64; 25]) {
+    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+    if crate::simd::keccak_f1600(state) {
+        return;
+    }
+    keccak_f1600_portable(state)
+}
+
+/// [`keccak_f1600`] for any processor. A plain function, as `keccak_f1600` was in 0.1.2: forcing
+/// it inline into the three callers made SHAKE256 14% slower on x86-64.
+#[allow(
+    non_snake_case,
+    clippy::assign_op_pattern,
+    clippy::identity_op,
+    clippy::manual_rotate
+)]
+#[rustfmt::skip]
+pub(crate) fn keccak_f1600_portable(state: &mut [u64; 25]) {
+    keccak_f1600_body!(state)
+}
+
+/// [`keccak_f1600_portable`] compiled for BMI1 and BMI2; called by `simd::keccak_f1600` on
+/// processors that have them.
+#[cfg(all(feature = "simd", target_arch = "x86_64"))]
+#[allow(
+    non_snake_case,
+    clippy::assign_op_pattern,
+    clippy::identity_op,
+    clippy::manual_rotate
+)]
+#[rustfmt::skip]
+#[target_feature(enable = "bmi1,bmi2")]
+pub(crate) fn keccak_f1600_bmi(state: &mut [u64; 25]) {
+    keccak_f1600_body!(state)
 }
 
 /// SHAKE256 (fn-dsa `SHAKE<256>`, fn-dsa-comm/src/shake.rs:577-682): absorb with

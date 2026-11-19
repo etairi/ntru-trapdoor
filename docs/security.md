@@ -85,6 +85,13 @@ fn-dsa's). The following run in variable time:
 - native `f64` arithmetic, on some CPUs;
 - the rejection loops, and the base draw's rare fallback (probability 2^-58.1 per draw);
 - key generation: the binary-search CDT, the candidate loop and the big-integer NTRUSolve.
+- the Bernoulli test's exact path, which runs in 2 of 256 trials whatever the inputs. Jointly
+  with the trial's outcome that event depends on the inputs, as the second byte of the lazy
+  comparison already does.
+
+The `simd` feature (off by default) adds the crate's only `unsafe` code, in one module
+(`src/simd`): SIMD kernels chosen at run time, each with the same results as the portable code
+it replaces, which the tests compare.
 
 The ring arithmetic uses masks; `inverse` reveals only whether an element is a unit.
 `PreparedRqPoly::mul_ternary` also reveals whether its operand is ternary, because it takes a

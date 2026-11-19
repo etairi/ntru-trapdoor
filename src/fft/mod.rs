@@ -37,9 +37,13 @@ mod gm;
 
 use gm::GM;
 
+/// The twiddle `(GM[4], GM[5])` of the split and merge at `logn = 2`, for ffSampling's unrolled
+/// `logn = 2` node.
+pub(crate) const GM_LOGN2: (f64, f64) = (GM[4], GM[5]);
+
 /// Complex multiplication (fn-dsa poly.rs:34-38).
 #[inline(always)]
-fn flc_mul(x_re: f64, x_im: f64, y_re: f64, y_im: f64) -> (f64, f64) {
+pub(crate) fn flc_mul(x_re: f64, x_im: f64, y_re: f64, y_im: f64) -> (f64, f64) {
     (x_re * y_re - x_im * y_im, x_re * y_im + x_im * y_re)
 }
 

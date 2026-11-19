@@ -41,6 +41,11 @@ rayon = { version = "1.3", optional = true }
 [features]
 default = []
 parallel = ["dep:rayon"]
+# SIMD kernels chosen at run time on processors that have the instructions (x86-64: AVX2 for the
+# NTT, BMI1 and BMI2 for Keccak. aarch64: NEON for the NTT), with the same outputs as the
+# portable code. The one module that holds them (src/simd) may use unsafe code, and the rest of
+# the crate denies it. No effect on other architectures.
+simd = []
 
 [dev-dependencies]
 # Benchmarks (benches/sign.rs, benches/keygen.rs). Same major version as the PCS and Jali.
@@ -66,8 +71,7 @@ harness = false
 name = "e2e"
 harness = false
 
-[lints.rust]
-unsafe_code = "forbid"
+# `unsafe_code` is forbidden in src/lib.rs, except in the module of the `simd` feature.
 
 # Statistical tests draw 10^7 samples and more: optimise test builds.
 [profile.test]

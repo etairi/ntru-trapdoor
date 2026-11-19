@@ -137,9 +137,13 @@ impl NttPrime {
             a[1] = mp_sub(u, v, p);
             return;
         }
-        // Layer lm has m = 2^lm blocks of t = n/m values, block i with the root gm[m + i].
-        let mut t = n;
-        let mut m = 1usize;
+        // Layer lm has m = 2^lm blocks of t = n/m values, block i with the root gm[m + i]. With
+        // the `simd` feature, AVX2 or NEON runs the layers whose half-blocks have 8 values or
+        // more (4 with NEON).
+        #[cfg(all(feature = "simd", any(target_arch = "x86_64", target_arch = "aarch64")))]
+        let (mut t, mut m) = crate::simd::ntt_wide_layers(self, logn, a);
+        #[cfg(not(all(feature = "simd", any(target_arch = "x86_64", target_arch = "aarch64"))))]
+        let (mut t, mut m) = (n, 1usize);
         while t > 4 {
             let ht = t >> 1;
             for (blk, &s) in a.chunks_exact_mut(t).zip(self.gm[m..2 * m].iter()) {
@@ -213,10 +217,15 @@ impl NttPrime {
                 mp_mmul(mp_sub(x1, x3, p), s, p, p0i),
             ];
         }
-        // Layer lm >= 2: hm = n / 2^(lm + 1) blocks of 2t values, block i with igm[hm + i].
+        // Layer lm >= 2: hm = n / 2^(lm + 1) blocks of 2t values, block i with igm[hm + i]. With
+        // the `simd` feature, AVX2 runs the layers from t = 8 on (NEON from t = 4).
         let mut t = 4usize;
         let mut hm = n >> 3;
         while t < n {
+            #[cfg(all(feature = "simd", any(target_arch = "x86_64", target_arch = "aarch64")))]
+            if crate::simd::intt_wide_layers(self, logn, a, t, hm) {
+                break;
+            }
             let dt = t << 1;
             for (blk, &s) in a.chunks_exact_mut(dt).zip(self.igm[hm..2 * hm].iter()) {
                 let (x, y) = blk.split_at_mut(t);
@@ -236,6 +245,10 @@ impl NttPrime {
     /// the plain product [`NttPrime::mul`].
     pub(crate) fn pointwise_mul_div_n(&self, logn: u32, a: &mut [u32], b: &[u32]) {
         let c = self.ninv_r2[logn as usize];
+        #[cfg(all(feature = "simd", any(target_arch = "x86_64", target_arch = "aarch64")))]
+        if crate::simd::mmul_slices_const(self, a, Some(b), c) {
+            return;
+        }
         for (x, &y) in a.iter_mut().zip(b.iter()) {
             *x = self.mmul(self.mmul(*x, y), c);
         }
@@ -245,6 +258,10 @@ impl NttPrime {
     /// Montgomery product per point instead of two.
     pub(crate) fn scale_prepared(&self, logn: u32, a: &mut [u32]) {
         let c = self.ninv_r2[logn as usize];
+        #[cfg(all(feature = "simd", any(target_arch = "x86_64", target_arch = "aarch64")))]
+        if crate::simd::mmul_slices_const(self, a, None, c) {
+            return;
+        }
         for x in a.iter_mut() {
             *x = self.mmul(*x, c);
         }
@@ -252,6 +269,10 @@ impl NttPrime {
 
     /// Pointwise `a <- a * b / n` for `b` in the prepared form ([`NttPrime::scale_prepared`]).
     pub(crate) fn pointwise_mul_prepared(&self, a: &mut [u32], b: &[u32]) {
+        #[cfg(all(feature = "simd", any(target_arch = "x86_64", target_arch = "aarch64")))]
+        if crate::simd::mmul_slices(self, a, b) {
+            return;
+        }
         for (x, &y) in a.iter_mut().zip(b.iter()) {
             *x = self.mmul(*x, y);
         }
@@ -478,11 +499,17 @@ pub(crate) fn sum_of_prepared_products_mod_q(
             b2.copy_from_slice(&b[..n]);
             P1.ntt(logn, &mut b1);
             P2.ntt(logn, &mut b2);
-            for ((s, &x), &y) in acc1.iter_mut().zip(b1.iter()).zip(a1[..n].iter()) {
-                *s = mp_add(*s, P1.mmul(x, y), P1.p);
-            }
-            for ((s, &x), &y) in acc2.iter_mut().zip(b2.iter()).zip(a2[..n].iter()) {
-                *s = mp_add(*s, P2.mmul(x, y), P2.p);
+            for (pr, acc, bb, aa) in [
+                (&P1, &mut acc1, &b1, &a1[..n]),
+                (&P2, &mut acc2, &b2, &a2[..n]),
+            ] {
+                #[cfg(all(feature = "simd", any(target_arch = "x86_64", target_arch = "aarch64")))]
+                if crate::simd::mmul_add_slices(pr, acc, bb, aa) {
+                    continue;
+                }
+                for ((s, &x), &y) in acc.iter_mut().zip(bb.iter()).zip(aa.iter()) {
+                    *s = mp_add(*s, pr.mmul(x, y), pr.p);
+                }
             }
         }
         P1.intt_n(logn, &mut acc1);

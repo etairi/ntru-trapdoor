@@ -44,10 +44,14 @@ ntru-trapdoor = "0.1"
 ```
 
 The optional `parallel` feature runs `samp_pre_batch` on all cores, through rayon:
-`ntru-trapdoor = { version = "0.1", features = ["parallel"] }`.
+`ntru-trapdoor = { version = "0.1", features = ["parallel"] }`. The optional `simd`
+feature selects SIMD kernels at run time (AVX2 and BMI2 on x86-64, NEON on aarch64), with the
+same outputs, in the crate's only module with `unsafe` code. On x86-64, building with
+`RUSTFLAGS="-C target-cpu=x86-64-v3"` speeds up the rest as well, again with the same outputs
+(see [testing and benchmarks](docs/testing.md)).
 
-The crate forbids `unsafe` code. Its only dependencies are `zeroize` and, for key generation,
-`num-bigint`, `num-integer` and `num-traits`.
+Without the `simd` feature the crate forbids `unsafe` code. Its only dependencies are `zeroize`
+and, for key generation, `num-bigint`, `num-integer` and `num-traits`.
 
 ## Quick start
 
@@ -122,15 +126,16 @@ Xeon (x86-64) table and the setup.
 
 | Operation | PCS | Falcon-1024 |
 |---|---|---|
-| key generation (`trapgen`) | 6.0 ms | 4.2 ms |
-| sampling tree (`ExpandedKey::new`) | 53 µs | 53 µs |
-| preimage (`samp_pre`) | 146 µs | 186 µs |
+| key generation (`trapgen`) | 5.8 ms | 4.1 ms |
+| sampling tree (`ExpandedKey::new`) | 51 µs | 51 µs |
+| preimage (`samp_pre`) | 130 µs | 163 µs |
 | `verify` | 20 µs | 20 µs |
-| `R_q` multiplication / inversion | 28 µs / 58 µs | 27 µs / 56 µs |
+| `R_q` multiplication / inversion | 27 µs / 55 µs | 27 µs / 54 µs |
 
-For comparison, fn-dsa 0.4.0 signs a Falcon-1024 message in 211 µs on the same machine. Sampling
-scales with threads that share one key: about 27,000 preimages per second on 8 threads at
-`Params::PCS`.
+With the `simd` feature (NEON), `verify` takes 11 µs, a multiplication 13 µs and an inversion
+35 µs. For comparison, fn-dsa 0.4.0 signs a Falcon-1024 message in 215 µs on the same machine.
+Sampling scales with threads that share one key: about 33,000 preimages per second on 8 threads
+at `Params::PCS`.
 
 ## Documentation
 

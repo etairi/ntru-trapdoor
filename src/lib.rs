@@ -87,7 +87,16 @@
 //!
 //! Ported from fn-dsa (Thomas Pornin, The Unlicense), falcon-rust (Alan Szepieniec, MIT) and
 //! Jali (MIT); see `NOTICE`.
-#![forbid(unsafe_code)]
+// No unsafe code, except in the module `simd` (the `simd` feature on x86-64 and aarch64), which
+// holds the SIMD kernels chosen at run time.
+#![cfg_attr(
+    not(all(feature = "simd", any(target_arch = "x86_64", target_arch = "aarch64"))),
+    forbid(unsafe_code)
+)]
+#![cfg_attr(
+    all(feature = "simd", any(target_arch = "x86_64", target_arch = "aarch64")),
+    deny(unsafe_code)
+)]
 #![warn(missing_docs)]
 
 // Shared types.
@@ -104,6 +113,8 @@ mod prng;
 mod ring;
 mod sampler;
 mod sign;
+#[cfg(all(feature = "simd", any(target_arch = "x86_64", target_arch = "aarch64")))]
+mod simd;
 
 // TrapGen and the key encodings.
 mod codec;

@@ -49,8 +49,9 @@
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::fft::{
-    fft, merge_sub_mul_add_split, poly_add, poly_ldl_fft, poly_merge_fft, poly_muladj_fft,
-    poly_mulownadj_fft, poly_neg, poly_set_small, poly_split_fft, poly_split_selfadj_fft,
+    GM_LOGN2, fft, flc_mul, merge_sub_mul_add_split, poly_add, poly_ldl_fft, poly_merge_fft,
+    poly_muladj_fft, poly_mulownadj_fft, poly_neg, poly_set_small, poly_split_fft,
+    poly_split_selfadj_fft,
 };
 use crate::prng::shake256;
 use crate::sampler::LeafSampler;
@@ -359,6 +360,10 @@ pub(crate) fn ffsampling<S: LeafSampler>(
         return;
     }
 
+    if logn == 2 {
+        return ffsampling_logn2(samp, t0, t1, tree);
+    }
+
     let n = 1usize << logn;
     let hn = n >> 1;
     let sub = tree_size(logn - 1);
@@ -383,6 +388,74 @@ pub(crate) fn ffsampling<S: LeafSampler>(
         ffsampling(samp, logn - 1, w0, w1, left, rest);
         poly_merge_fft(logn, t0, w0, w1);
     }
+}
+
+/// The `logn = 1` node of [`ffsampling`] on scalars: `(t0, t1)` = `([t0_re, t0_im], [t1_re,
+/// t1_im])` in, `(z0, z1)` out, with the node's tree values `[l01_re, l01_im, leaf_r, leaf_l]`.
+#[inline(always)]
+fn node_logn1<S: LeafSampler>(samp: &mut S, t0: &mut [f64; 2], t1: &mut [f64; 2], tree: &[f64]) {
+    let (l01_re, l01_im, leaf_r, leaf_l) = (tree[0], tree[1], tree[2], tree[3]);
+    let w0 = t1[0];
+    let w1 = t1[1];
+    let y0 = samp.sample(w0, leaf_r) as f64;
+    let y1 = samp.sample(w1, leaf_r) as f64;
+    let (a_re, a_im) = (w0 - y0, w1 - y1);
+    let (b_re, b_im) = (a_re * l01_re - a_im * l01_im, a_re * l01_im + a_im * l01_re);
+    let (x0, x1) = (t0[0] + b_re, t0[1] + b_im);
+    *t1 = [y0, y1];
+    *t0 = [
+        samp.sample(x0, leaf_l) as f64,
+        samp.sample(x1, leaf_l) as f64,
+    ];
+}
+
+/// [`ffsampling`] at `logn = 2`, unrolled on scalars: the split of `t1`, the right leaf node,
+/// the fused merge, product and split (`merge_sub_mul_add_split`), the left leaf node and the
+/// final merge, with the same operations on the same values as the general recursion (test
+/// `logn2_node_equals_recursion`). Removes the slicing and the calls of the 256 nodes of this
+/// size per SampPre.
+#[inline(always)]
+fn ffsampling_logn2<S: LeafSampler>(samp: &mut S, t0: &mut [f64], t1: &mut [f64], tree: &[f64]) {
+    let (g_re, g_im) = GM_LOGN2;
+    let (l10, rest) = tree.split_at(4);
+    let (right, left) = rest.split_at(4);
+    let l10: [f64; 4] = [l10[0], l10[1], l10[2], l10[3]];
+    let t0v: [f64; 4] = [t0[0], t0[1], t0[2], t0[3]];
+    let t1v: [f64; 4] = [t1[0], t1[1], t1[2], t1[3]];
+
+    // poly_split_fft(2, w0, w1, t1).
+    let (a_re, b_re, a_im, b_im) = (t1v[0], t1v[1], t1v[2], t1v[3]);
+    let mut w0 = [(a_re + b_re) * 0.5, (a_im + b_im) * 0.5];
+    let (u_re, u_im) = flc_mul(a_re - b_re, a_im - b_im, g_re, -g_im);
+    let mut w1 = [u_re * 0.5, u_im * 0.5];
+
+    node_logn1(samp, &mut w0, &mut w1, right);
+
+    // merge_sub_mul_add_split(2, w, t0, t1, l10).
+    let (b_re, b_im) = flc_mul(w1[0], w1[1], g_re, g_im);
+    let z_re = [w0[0] + b_re, w0[0] - b_re];
+    let z_im = [w0[1] + b_im, w0[1] - b_im];
+    let mut tb_re = [0.0f64; 2];
+    let mut tb_im = [0.0f64; 2];
+    for k in 0..2 {
+        let x_re = t1v[k] - z_re[k];
+        let x_im = t1v[2 + k] - z_im[k];
+        let (y_re, y_im) = flc_mul(x_re, x_im, l10[k], l10[2 + k]);
+        tb_re[k] = t0v[k] + y_re;
+        tb_im[k] = t0v[2 + k] + y_im;
+    }
+    t1[..4].copy_from_slice(&[z_re[0], z_re[1], z_im[0], z_im[1]]);
+    let [a_re, b_re] = tb_re;
+    let [a_im, b_im] = tb_im;
+    let mut w0 = [(a_re + b_re) * 0.5, (a_im + b_im) * 0.5];
+    let (u_re, u_im) = flc_mul(a_re - b_re, a_im - b_im, g_re, -g_im);
+    let mut w1 = [u_re * 0.5, u_im * 0.5];
+
+    node_logn1(samp, &mut w0, &mut w1, left);
+
+    // poly_merge_fft(2, t0, w0, w1).
+    let (b_re, b_im) = flc_mul(w1[0], w1[1], g_re, g_im);
+    t0[..4].copy_from_slice(&[w0[0] + b_re, w0[0] - b_re, w0[1] + b_im, w0[1] - b_im]);
 }
 
 #[cfg(test)]
@@ -706,6 +779,102 @@ mod tests {
         assert_eq!(tree_size(10), 11264);
         for logn in 2..=10 {
             assert_eq!(tree_size(logn), (1 << logn) + 2 * tree_size(logn - 1));
+        }
+    }
+
+    /// The general recursion of [`ffsampling`] without the unrolled `logn = 2` node (a copy of
+    /// its code): the reference of `logn2_node_equals_recursion`.
+    #[allow(clippy::too_many_arguments)]
+    fn ffsampling_ref<S: LeafSampler>(
+        samp: &mut S,
+        logn: u32,
+        t0: &mut [f64],
+        t1: &mut [f64],
+        tree: &[f64],
+        tmp: &mut [f64],
+    ) {
+        if logn == 1 {
+            // sampler.rs:527-557. t1's split is trivial: w0 = t1[0], w1 = t1[1].
+            let (l01_re, l01_im, leaf_r, leaf_l) = (tree[0], tree[1], tree[2], tree[3]);
+            let w0 = t1[0];
+            let w1 = t1[1];
+            let y0 = samp.sample(w0, leaf_r) as f64;
+            let y1 = samp.sample(w1, leaf_r) as f64;
+            // tb0 = t0 + (t1 - z1) * l10, z1 into t1.
+            let (a_re, a_im) = (w0 - y0, w1 - y1);
+            let (b_re, b_im) = (a_re * l01_re - a_im * l01_im, a_re * l01_im + a_im * l01_re);
+            let (x0, x1) = (t0[0] + b_re, t0[1] + b_im);
+            t1[0] = y0;
+            t1[1] = y1;
+            t0[0] = samp.sample(x0, leaf_l) as f64;
+            t0[1] = samp.sample(x1, leaf_l) as f64;
+            return;
+        }
+
+        let n = 1usize << logn;
+        let hn = n >> 1;
+        let sub = tree_size(logn - 1);
+        let (l10, rest) = tree.split_at(n);
+        let (right, left) = rest.split_at(sub);
+        let (w, rest) = tmp.split_at_mut(n);
+
+        // Split t1, sample the right sub-tree (sampler.rs:593-601).
+        {
+            let (w0, w1) = w.split_at_mut(hn);
+            poly_split_fft(logn, w0, w1, t1);
+            ffsampling_ref(samp, logn - 1, w0, w1, right, rest);
+        }
+
+        // Merge z1 into t1, tb0 = t0 + (t1 - z1) * l10, split tb0 into (w0, w1)
+        // (sampler.rs:602-626), in one pass with the same operations.
+        merge_sub_mul_add_split(logn, w, t0, t1, l10);
+
+        // Sample the left sub-tree, merge into t0 (sampler.rs:627-634).
+        {
+            let (w0, w1) = w.split_at_mut(hn);
+            ffsampling_ref(samp, logn - 1, w0, w1, left, rest);
+            poly_merge_fft(logn, t0, w0, w1);
+        }
+    }
+
+    /// A deterministic leaf sampler for the tests: an integer near `mu` that depends on the
+    /// width and on a call counter.
+    struct Rounding(u64);
+    impl LeafSampler for Rounding {
+        fn sample(&mut self, mu: f64, isigma: f64) -> i32 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let off = ((self.0 >> 33) % 7) as f64 - 3.0;
+            (mu + off * isigma).round() as i32
+        }
+    }
+
+    /// The unrolled `logn = 2` node gives the general recursion's output bit for bit, at every
+    /// degree (on random trees and targets, with a deterministic leaf sampler).
+    #[test]
+    fn logn2_node_equals_recursion() {
+        for logn in 2..=10u32 {
+            let n = 1usize << logn;
+            let mut rng = Shake256Prng::new(&[b'u', logn as u8]);
+            let mut rnd =
+                || ((rng.next_u64() >> 11) as f64 / (1u64 << 53) as f64) * 2000.0 - 1000.0;
+            let tree: Vec<f64> = (0..tree_size(logn)).map(|_| rnd() / 997.0).collect();
+            let t0: Vec<f64> = (0..n).map(|_| rnd()).collect();
+            let t1: Vec<f64> = (0..n).map(|_| rnd()).collect();
+            let (mut a0, mut a1, mut b0, mut b1) = (t0.clone(), t1.clone(), t0, t1);
+            let (mut ta, mut tb) = (vec![0.0; 2 * n], vec![0.0; 2 * n]);
+            let (mut sa, mut sb) = (Rounding(logn as u64), Rounding(logn as u64));
+            ffsampling(&mut sa, logn, &mut a0, &mut a1, &tree, &mut ta);
+            ffsampling_ref(&mut sb, logn, &mut b0, &mut b1, &tree, &mut tb);
+            let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<u64>>();
+            assert_eq!(
+                (bits(&a0), bits(&a1)),
+                (bits(&b0), bits(&b1)),
+                "logn {logn}"
+            );
+            assert_eq!(sa.0, sb.0, "leaf count, logn {logn}");
         }
     }
 }

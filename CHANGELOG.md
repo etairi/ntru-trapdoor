@@ -4,6 +4,31 @@ All notable changes to this crate. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the crate follows
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+Faster, with the same outputs as 0.1.2: the known-answer tests and the fn-dsa parity tests pass
+unchanged, with and without the new feature.
+
+### Added
+
+- The `simd` feature, off by default: SIMD kernels chosen at run time, in one module that may
+  use `unsafe` code (the rest of the crate denies it). On x86-64, AVX2 for the NTT and its
+  pointwise products, and Keccak compiled for BMI1 and BMI2. On aarch64, NEON for the NTT. The
+  environment variable `NTRU_TRAPDOOR_SCALAR` keeps the portable code. With it, a product in
+  `R_q` takes 42 % less time on an Intel Xeon 8581C and 52 % less on an Apple M4, and Verify
+  33 % and 45 % less.
+
+### Changed
+
+- SampPre is faster, by 10 % at `Params::PCS` and 6 % at Falcon-1024 on the Xeon, and by 7 to
+  8 % on the M4.
+  - The Bernoulli step decides its first byte from an `f64` estimate of the threshold and
+    computes FACCT's polynomial only in 2 of 256 trials, with the same result and the same PRNG
+    bytes (a lemma, recorded in the sampler's documentation).
+  - ffSampling's nodes of degree 4 are unrolled.
+- `RqPoly::to_bytes` and `PublicKey::to_bytes` write 32 bits at a time: 2.4 times faster on the
+  M4 and 2.9 times on the Xeon, with the same bytes.
+
 ## [0.1.2] - 2026-11-19
 
 Faster, with the same outputs: for the same inputs and seeds, every key, preimage, product and

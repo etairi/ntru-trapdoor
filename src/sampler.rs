@@ -44,6 +44,19 @@
 //! (about $`2^{-96}`$ per trial), which the parity tests cannot reach. fn-dsa's reduction never
 //! yields $`r<0`$ for $`s\le63`$ (design.md §0, finding 1), so it is ported without a clamp.
 //!
+//! **First-byte shortcut.** `ber_exp` compares a uniform 64-bit value with the threshold
+//! $`z\approx2^{64}ccs\,e^{-x}`$ from the top byte down, and the first byte decides in all but
+//! 1 of 256 trials. The sampler computes FACCT's polynomial only when that first byte could be
+//! decided otherwise: an `f64` estimate $`f`$ of $`z/2^{56}`$ (a degree-5 Taylor polynomial of
+//! $`e^{-u}`$ around $`\ln2/2`$) gives $`m=\min(254,\max(0,\lfloor f-1/32\rfloor))`$, a first
+//! byte below $`m`$ accepts, one above $`m+1`$ rejects, and $`m`$ or $`m+1`$ (2 of 256 trials)
+//! run the exact comparison from that byte on. For $`x\ge0`$ and $`1/2\le ccs\le1`$,
+//! $`|f-z/2^{56}|\le6.2\cdot10^{-4}`$, so $`\lfloor z/2^{56}\rfloor\in\{m,m+1\}`$, and the
+//! result and the bytes read are those of `ber_exp` (lemma of the 2026-11-18 study: a paper
+//! proof whose numerical steps are certified with interval arithmetic, the window logic checked
+//! in Lean, and 6.4e9 inputs compared in Rust). Leaves outside that range of `ccs`, and
+//! negative or NaN `x`, take `ber_exp` itself.
+//!
 //! **Preconditions** (enforced for every leaf by [`crate::ExpandedKey::new`]):
 //! $`\sigma_{\min}\le\sigma'`$ (so $`ccs\le1`$) and $`\sigma'<\sigma_0`$ with a $`2^{-40}`$ rounding
 //! margin (so $`x\ge0`$). Outside them the output distribution is wrong; the sampler does not
@@ -52,7 +65,9 @@
 //! **Side channels** (as fn-dsa): full table scans; the acceptance probability per trial is
 //! independent of $`\sigma'`$ and $`\mu`$ (0.633687 for the PCS base, 0.584958 for Falcon's
 //! [computed, design.md §2]); the lazy byte comparison in `ber_exp` leaks only accept or reject.
-//! Native `f64` arithmetic may be variable-time on some CPUs.
+//! The first-byte shortcut computes FACCT's polynomial in 2 of 256 trials, whatever the inputs.
+//! Jointly with the trial's outcome that event depends on the inputs, as the lazy comparison's
+//! second byte already does. Native `f64` arithmetic may be variable-time on some CPUs.
 //!
 //! Used by the tests through `hazmat`: [`LeafSampler`], [`SamplerZ`].
 
@@ -105,6 +120,10 @@ impl<'a, P: Prng> SamplerZ<'a, P> {
 
         // ccs = sigma_min / sigma = sigma_min * isigma.
         let ccs = isigma * self.params.sigma_min;
+        // The first-byte shortcut of the Bernoulli step holds for 1/2 <= ccs <= 1 (module
+        // documentation), which every leaf of a valid key satisfies. Other leaves (reachable
+        // only through `hazmat`) take the exact step on every trial.
+        let shortcut = (0.5..=1.0).contains(&ccs);
 
         loop {
             // Bimodal proposal: z0 from the half-Gaussian of width sigma0, b a random bit;
@@ -118,7 +137,12 @@ impl<'a, P: Prng> SamplerZ<'a, P> {
             let t = z as f64 - r;
             let mut x = (t * t) * dss;
             x -= ((z0 * z0) as f64) * B::INV_2SQRSIGMA0;
-            if ber_exp(self.prng, x, ccs) {
+            let accept = if shortcut {
+                ber_exp_shortcut(self.prng, x, ccs)
+            } else {
+                ber_exp(self.prng, x, ccs)
+            };
+            if accept {
                 return s + z;
             }
         }
@@ -277,6 +301,72 @@ fn ber_exp<P: Prng>(prng: &mut P, x: f64, ccs: f64) -> bool {
 
     // Lazy comparison with a uniform 64-bit value, high byte first; it leaks only the outcome.
     for i in 0..8 {
+        let w = prng.next_u8();
+        let bz = (z >> (56 - (i << 3))) as u8;
+        if w != bz {
+            return w < bz;
+        }
+    }
+    false
+}
+
+/// Half-width of the first-byte window of [`ber_exp_shortcut`], in units of the top byte.
+const DELTA: f64 = 1.0 / 32.0;
+/// The expansion point of the estimate: $`\ln2/2`$ (bit for bit `LOG2 / 2`).
+const R0: f64 = 0.346_573_590_279_972_65;
+/// $`2^8e^{-R_0}`$, rounded (one unit in the last place below the nearest `f64`, which the
+/// error bound includes).
+const E0: f64 = 0.707_106_781_186_547_5 * 256.0;
+
+/// [`ber_exp`] with the first byte decided from an `f64` estimate of the threshold's top byte
+/// (module documentation, "First-byte shortcut"): the same result and the same PRNG bytes as
+/// [`ber_exp`] for every `x >= 0` and `1/2 <= ccs <= 1`. FACCT's polynomial runs only when the
+/// first byte is `m` or `m + 1`, `m = clamp(floor(f - 1/32), 0, 254)`: in 2 of 256 trials,
+/// whatever the inputs. Other `x` (negative, NaN) take [`ber_exp`].
+#[inline(always)]
+fn ber_exp_shortcut<P: Prng>(prng: &mut P, x: f64, ccs: f64) -> bool {
+    if x.is_nan() || x < 0.0 {
+        return ber_exp(prng, x, ccs);
+    }
+    let s = (x * INV_LOG2) as i64;
+    let r = x - (s as f64) * LOG2;
+    // f ~ ccs e^-r 2^(8 - s) = z / 2^56, within 6.2e-4 for 0 <= s <= 7. For s >= 8 the
+    // threshold's top byte is 0 (s >= 64: the threshold is 0), and f = 0 gives m = 0.
+    let f = if s < 8 {
+        let u = r - R0;
+        let u2 = u * u;
+        let p = (1.0 - u) + u2 * ((0.5 - u * (1.0 / 6.0)) + u2 * (1.0 / 24.0 - u * (1.0 / 120.0)));
+        (ccs * f64::from_bits((1023 - s as u64) << 52)) * (E0 * p)
+    } else {
+        0.0
+    };
+    let w0 = prng.next_u8();
+    let fl = f - DELTA;
+    let m = if fl < 0.0 { 0 } else { (fl as u32).min(254) };
+    let w = w0 as u32;
+    if w < m {
+        return true;
+    }
+    if w > m + 1 {
+        return false;
+    }
+    ber_exp_from(prng, w0, x, ccs)
+}
+
+/// [`ber_exp`] from an already read first byte `w0`: the exact threshold, then the lazy
+/// comparison from byte 0 on.
+#[cold]
+#[inline(never)]
+fn ber_exp_from<P: Prng>(prng: &mut P, w0: u8, x: f64, ccs: f64) -> bool {
+    let s = (x * INV_LOG2) as i64;
+    let r = x - (s as f64) * LOG2;
+    let keep = (s.wrapping_sub(64) >> 63) as u64;
+    let z = ((expm_p63(r, ccs) << 1).wrapping_sub(1) >> ((s as u32) & 63)) & keep;
+    let bz = (z >> 56) as u8;
+    if w0 != bz {
+        return w0 < bz;
+    }
+    for i in 1..8 {
         let w = prng.next_u8();
         let bz = (z >> (56 - (i << 3))) as u8;
         if w != bz {
@@ -651,6 +741,149 @@ mod tests {
             let acc = draws as f64 / s.trials() as f64;
             // 6 standard errors of a binomial proportion over ~3.2e5 trials.
             assert!((acc - 0.633687).abs() < 0.006, "acceptance {acc}");
+        }
+    }
+
+    /// The exact threshold `z` of `ber_exp` (for building byte strings that reach deep bytes).
+    fn threshold(x: f64, ccs: f64) -> u64 {
+        let s = (x * INV_LOG2) as i64;
+        let r = x - (s as f64) * LOG2;
+        let keep = (s.wrapping_sub(64) >> 63) as u64;
+        ((expm_p63(r, ccs) << 1).wrapping_sub(1) >> ((s as u32) & 63)) & keep
+    }
+
+    /// `ber_exp_shortcut` returns what `ber_exp` returns and reads the same bytes: random inputs
+    /// over the sampler's range, the boundaries of the lemma (x at and next to every k ln 2,
+    /// s = 7 / 8 and 63 / 64, ccs at 1/2 and 1, the clamp edges of the window), and byte strings
+    /// aimed at the window (the first byte equal to the threshold's top byte or next to it) and
+    /// at the deeper bytes. Negative, NaN and infinite x go to `ber_exp` by construction.
+    #[test]
+    fn ber_exp_shortcut_equals_ber_exp() {
+        let mut rng = Shake256Prng::new(b"ber-shortcut");
+        let mut xs: Vec<f64> = Vec::new();
+        for k in 0..=70u32 {
+            let base = k as f64 * LOG2;
+            let mut v = base;
+            for _ in 0..4 {
+                xs.push(v);
+                v = v.next_down();
+            }
+            let mut v = base;
+            for _ in 0..4 {
+                v = v.next_up();
+                xs.push(v);
+            }
+        }
+        xs.extend([0.0, -0.0, 5e-324, f64::INFINITY, -1.0, f64::NAN, 1e300]);
+        for _ in 0..20_000 {
+            let u = (rng.next_u64() >> 11) as f64 / (1u64 << 53) as f64;
+            xs.push(u * 12.0);
+            xs.push(u * 100.0);
+            xs.push(u * 1e-6);
+        }
+        let mut ccss = vec![
+            0.5,
+            0.5f64.next_up(),
+            1.0,
+            1.0f64.next_down(),
+            0.7152373,
+            0.7131449,
+        ];
+        for _ in 0..8 {
+            ccss.push(0.5 + 0.5 * (rng.next_u64() >> 11) as f64 / (1u64 << 53) as f64);
+        }
+        let mut cases = 0u64;
+        for &x in &xs {
+            for &ccs in &ccss {
+                let z = if x >= 0.0 { threshold(x, ccs) } else { 0 };
+                let top = (z >> 56) as u8;
+                let mut firsts = vec![
+                    top,
+                    top.wrapping_add(1),
+                    top.wrapping_sub(1),
+                    0,
+                    1,
+                    254,
+                    255,
+                ];
+                firsts.push(rng.next_u8());
+                for &w0 in &firsts {
+                    // Bytes equal to the threshold's after the first, then random: the deep path.
+                    for deep in [false, true] {
+                        let mut bytes = vec![w0];
+                        for i in 1..8 {
+                            bytes.push(if deep {
+                                (z >> (56 - 8 * i)) as u8
+                            } else {
+                                rng.next_u8()
+                            });
+                        }
+                        bytes.extend((0..8).map(|_| rng.next_u8()));
+                        let (mut a, mut b) = (Bytes(bytes.clone(), 0), Bytes(bytes, 0));
+                        let ra = ber_exp(&mut a, x, ccs);
+                        let rb = ber_exp_shortcut(&mut b, x, ccs);
+                        assert_eq!(
+                            (ra, a.1),
+                            (rb, b.1),
+                            "x {x:e} ({:#x}) ccs {ccs} w0 {w0}",
+                            x.to_bits()
+                        );
+                        cases += 1;
+                    }
+                }
+            }
+        }
+        assert!(cases > 2_000_000, "{cases}");
+    }
+
+    /// A leaf sampler with the shortcut reads the same bytes and returns the same integers as
+    /// one with the exact step, over long streams at both bases (the known-answer tests check
+    /// the same through SampPre).
+    #[test]
+    fn sampler_with_shortcut_equals_exact() {
+        struct Exact<'a>(&'a mut Shake256Prng, Params);
+        for params in [Params::PCS, Params::FALCON_1024] {
+            let (lo, hi) = params.leaf_window();
+            let mut a = Shake256Prng::new(b"leaf-stream");
+            let mut b = Shake256Prng::new(b"leaf-stream");
+            let mut pick = Shake256Prng::new(b"leaf-centres");
+            let mut sa = SamplerZ::new(&params, &mut a);
+            let mut exact = Exact(&mut b, params);
+            for i in 0..200_000u32 {
+                let u = (pick.next_u64() >> 11) as f64 / (1u64 << 53) as f64;
+                let mu = (u - 0.5) * 4000.0;
+                let sigma = lo + (hi - lo) * ((i % 97) as f64 / 96.0);
+                let isigma = 1.0 / sigma;
+                let got = sa.sample(mu, isigma);
+                let want = exact_next(&mut exact, mu, isigma);
+                assert_eq!(got, want, "params {:?} leaf {i}", params.base);
+            }
+            fn exact_next(e: &mut Exact<'_>, mu: f64, isigma: f64) -> i32 {
+                let s = mu.floor() as i64;
+                let r = mu - s as f64;
+                let dss = (isigma * isigma) * 0.5;
+                let ccs = isigma * e.1.sigma_min;
+                loop {
+                    let (z0, b, inv) = match e.1.base {
+                        BaseSampler::HalfGauss3_1 => {
+                            let (z0, b) = HalfGauss31::draw(e.0);
+                            (z0, b, HalfGauss31::INV_2SQRSIGMA0)
+                        }
+                        BaseSampler::Falcon1_8205 => {
+                            let (z0, b) = Falcon18205::draw(e.0);
+                            (z0, b, Falcon18205::INV_2SQRSIGMA0)
+                        }
+                    };
+                    let z = b + ((b << 1) - 1) * z0;
+                    let t = z as f64 - r;
+                    let mut x = (t * t) * dss;
+                    x -= ((z0 * z0) as f64) * inv;
+                    if ber_exp(e.0, x, ccs) {
+                        return s as i32 + z;
+                    }
+                }
+            }
+            assert_eq!(a.next_u64(), b.next_u64(), "stream positions");
         }
     }
 }
