@@ -41,6 +41,25 @@ use gm::GM;
 /// `logn = 2` node.
 pub(crate) const GM_LOGN2: (f64, f64) = (GM[4], GM[5]);
 
+/// Defines a function and, with the `simd` feature on x86-64, its copy under the name after the
+/// slash: the same body compiled for AVX2, BMI1, BMI2, LZCNT and POPCNT, without FMA. SampPre
+/// runs through these copies on processors that have the instructions (sign.rs). Rust neither
+/// contracts nor reassociates floating-point operations, so both compilations perform the same
+/// IEEE operations in the same order and return the same bits.
+macro_rules! with_v3_copy {
+    (
+        $(#[$m:meta])*
+        $vis:vis fn $name:ident / $v3:ident ($($arg:ident: $ty:ty),* $(,)?) $body:block
+    ) => {
+        $(#[$m])*
+        $vis fn $name($($arg: $ty),*) $body
+
+        #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+        #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
+        pub(crate) fn $v3($($arg: $ty),*) $body
+    };
+}
+
 /// Complex multiplication (fn-dsa poly.rs:34-38).
 #[inline(always)]
 pub(crate) fn flc_mul(x_re: f64, x_im: f64, y_re: f64, y_im: f64) -> (f64, f64) {
@@ -57,30 +76,61 @@ pub fn fft(logn: u32, f: &mut [f64]) {
     // The first iteration of the textbook FFT is a no-op in this representation (poly.rs:53-57).
     let mut t = hn;
     for lm in 1..logn {
-        let m = 1usize << lm;
-        let hm = m >> 1;
-        let ht = t >> 1;
-        for i in 0..hm {
-            let j0 = i * t;
-            let s_re = GM[(m + i) << 1];
-            let s_im = GM[((m + i) << 1) + 1];
-            let (x_re, y_re) = re[j0..j0 + t].split_at_mut(ht);
-            let (x_im, y_im) = im[j0..j0 + t].split_at_mut(ht);
-            for (((xr, xi), yr), yi) in x_re
-                .iter_mut()
-                .zip(x_im.iter_mut())
-                .zip(y_re.iter_mut())
-                .zip(y_im.iter_mut())
-            {
-                let (z_re, z_im) = flc_mul(*yr, *yi, s_re, s_im);
-                let (a_re, a_im) = (*xr, *xi);
-                *xr = a_re + z_re;
-                *xi = a_im + z_im;
-                *yr = a_re - z_re;
-                *yi = a_im - z_im;
-            }
+        #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+        if crate::simd::fft_layer(re, im, t, 1usize << lm, &GM) {
+            t >>= 1;
+            continue;
         }
-        t = ht;
+        fft_layer(re, im, t, 1usize << lm);
+        t >>= 1;
+    }
+}
+
+/// One layer of [`fft`]: the `m/2` blocks of `t` values, block `i` with the twiddle
+/// `(GM[2(m + i)], GM[2(m + i) + 1])`.
+#[inline(always)]
+fn fft_layer(re: &mut [f64], im: &mut [f64], t: usize, m: usize) {
+    let hm = m >> 1;
+    let ht = t >> 1;
+    for i in 0..hm {
+        let j0 = i * t;
+        let s_re = GM[(m + i) << 1];
+        let s_im = GM[((m + i) << 1) + 1];
+        let (x_re, y_re) = re[j0..j0 + t].split_at_mut(ht);
+        let (x_im, y_im) = im[j0..j0 + t].split_at_mut(ht);
+        for (((xr, xi), yr), yi) in x_re
+            .iter_mut()
+            .zip(x_im.iter_mut())
+            .zip(y_re.iter_mut())
+            .zip(y_im.iter_mut())
+        {
+            let (z_re, z_im) = flc_mul(*yr, *yi, s_re, s_im);
+            let (a_re, a_im) = (*xr, *xi);
+            *xr = a_re + z_re;
+            *xi = a_im + z_im;
+            *yr = a_re - z_re;
+            *yi = a_im - z_im;
+        }
+    }
+}
+
+/// [`fft`] in the x86-64-v3 copy of SampPre: the AVX2 kernel on the layers whose half-blocks
+/// hold at least 4 values, [`fft_layer`] on the others.
+#[cfg(all(feature = "simd", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
+pub(crate) fn fft_v3(logn: u32, f: &mut [f64]) {
+    assert!(logn >= 1);
+    let n = 1usize << logn;
+    let hn = n >> 1;
+    let (re, im) = f[..n].split_at_mut(hn);
+    let mut t = hn;
+    for lm in 1..logn {
+        if t >= 8 {
+            crate::simd::fft_avx2::fft_layer(re, im, t, 1usize << lm, &GM);
+        } else {
+            fft_layer(re, im, t, 1usize << lm);
+        }
+        t >>= 1;
     }
 }
 
@@ -94,33 +144,13 @@ pub fn ifft(logn: u32, f: &mut [f64]) {
         let (re, im) = f[..n].split_at_mut(hn);
         let mut t = 1usize;
         for lm in 1..logn {
-            let hm = 1usize << (logn - lm);
-            let dt = t << 1;
-            for i in 0..(hm >> 1) {
-                let j0 = i * dt;
-                // 1/w is the conjugate of w (poly.rs:235-238).
-                let s_re = GM[(hm + i) << 1];
-                let s_im = -GM[((hm + i) << 1) + 1];
-                let (x_re, y_re) = re[j0..j0 + dt].split_at_mut(t);
-                let (x_im, y_im) = im[j0..j0 + dt].split_at_mut(t);
-                for (((xr, xi), yr), yi) in x_re
-                    .iter_mut()
-                    .zip(x_im.iter_mut())
-                    .zip(y_re.iter_mut())
-                    .zip(y_im.iter_mut())
-                {
-                    let (a_re, a_im) = (*xr, *xi);
-                    let (b_re, b_im) = (*yr, *yi);
-                    *xr = a_re + b_re;
-                    *xi = a_im + b_im;
-                    let d_re = a_re - b_re;
-                    let d_im = a_im - b_im;
-                    let (z_re, z_im) = flc_mul(d_re, d_im, s_re, s_im);
-                    *yr = z_re;
-                    *yi = z_im;
-                }
+            #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+            if crate::simd::ifft_layer(re, im, t, 1usize << (logn - lm), &GM) {
+                t <<= 1;
+                continue;
             }
-            t = dt;
+            ifft_layer(re, im, t, 1usize << (logn - lm));
+            t <<= 1;
         }
     }
     // logn - 1 delayed halvings: FLR::slice_div2e (flr_native.rs:361-366) multiplies by the
@@ -128,6 +158,67 @@ pub fn ifft(logn: u32, f: &mut [f64]) {
     let e = 1.0 / ((1u64 << (logn - 1)) as f64);
     for x in f[..n].iter_mut() {
         *x *= e;
+    }
+}
+
+/// One layer of [`ifft`]: the `hm/2` blocks of `2t` values, block `i` with the conjugated
+/// twiddle `(GM[2(hm + i)], -GM[2(hm + i) + 1])`.
+#[inline(always)]
+fn ifft_layer(re: &mut [f64], im: &mut [f64], t: usize, hm: usize) {
+    let dt = t << 1;
+    for i in 0..(hm >> 1) {
+        let j0 = i * dt;
+        // 1/w is the conjugate of w (poly.rs:235-238).
+        let s_re = GM[(hm + i) << 1];
+        let s_im = -GM[((hm + i) << 1) + 1];
+        let (x_re, y_re) = re[j0..j0 + dt].split_at_mut(t);
+        let (x_im, y_im) = im[j0..j0 + dt].split_at_mut(t);
+        for (((xr, xi), yr), yi) in x_re
+            .iter_mut()
+            .zip(x_im.iter_mut())
+            .zip(y_re.iter_mut())
+            .zip(y_im.iter_mut())
+        {
+            let (a_re, a_im) = (*xr, *xi);
+            let (b_re, b_im) = (*yr, *yi);
+            *xr = a_re + b_re;
+            *xi = a_im + b_im;
+            let d_re = a_re - b_re;
+            let d_im = a_im - b_im;
+            let (z_re, z_im) = flc_mul(d_re, d_im, s_re, s_im);
+            *yr = z_re;
+            *yi = z_im;
+        }
+    }
+}
+
+/// [`ifft`] in the x86-64-v3 copy of SampPre: the AVX2 kernel on the layers whose half-blocks
+/// hold at least 4 values and on the final scaling, [`ifft_layer`] on the others.
+#[cfg(all(feature = "simd", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
+pub(crate) fn ifft_v3(logn: u32, f: &mut [f64]) {
+    assert!(logn >= 1);
+    let n = 1usize << logn;
+    let hn = n >> 1;
+    {
+        let (re, im) = f[..n].split_at_mut(hn);
+        let mut t = 1usize;
+        for lm in 1..logn {
+            if t >= 4 {
+                crate::simd::fft_avx2::ifft_layer(re, im, t, 1usize << (logn - lm), &GM);
+            } else {
+                ifft_layer(re, im, t, 1usize << (logn - lm));
+            }
+            t <<= 1;
+        }
+    }
+    let e = 1.0 / ((1u64 << (logn - 1)) as f64);
+    if n.is_multiple_of(4) {
+        crate::simd::fft_avx2::scale(&mut f[..n], e);
+    } else {
+        for x in f[..n].iter_mut() {
+            *x *= e;
+        }
     }
 }
 
@@ -274,6 +365,10 @@ pub fn poly_ldl_fft(logn: u32, g00: &[f64], g01: &mut [f64], g11: &mut [f64]) {
 /// Split `f = f0(x^2) + x f1(x^2)` (FFT representation, half-size outputs; fn-dsa
 /// `poly_split_fft`, poly.rs:1250-1364, portable branch :1342-1363).
 pub fn poly_split_fft(logn: u32, f0: &mut [f64], f1: &mut [f64], f: &[f64]) {
+    #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+    if logn >= 3 && crate::simd::fft_split(logn, f0, f1, f, &GM[1 << logn..3 << (logn - 1)]) {
+        return;
+    }
     // If logn = 1 then the loop is entirely skipped.
     if logn == 1 {
         f0[0] = f[0];
@@ -334,6 +429,10 @@ pub fn poly_split_selfadj_fft(logn: u32, f0: &mut [f64], f1: &mut [f64], f: &[f6
 /// Merge `f <- f0(x^2) + x f1(x^2)` (FFT representation; fn-dsa `poly_merge_fft`,
 /// poly.rs:1466-1558, portable branch :1541-1557).
 pub fn poly_merge_fft(logn: u32, f: &mut [f64], f0: &[f64], f1: &[f64]) {
+    #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+    if logn >= 3 && crate::simd::fft_merge(logn, f, f0, f1, &GM[1 << logn..3 << (logn - 1)]) {
+        return;
+    }
     // If logn = 1 then the loop is entirely skipped.
     if logn == 1 {
         f[0] = f0[0];
@@ -357,10 +456,11 @@ pub fn poly_merge_fft(logn: u32, f: &mut [f64], f0: &[f64], f1: &[f64]) {
     }
 }
 
+with_v3_copy! {
 /// SampPre's target in one pass (fn-dsa lib.rs:621-640): from `t0` = FFT(t), `t1 <- t0 * b01 *
 /// (-inv_q)` and `t0 <- t0 * b11 * inv_q`. The same operations per value as `poly_mul_fft`
 /// followed by `poly_mulconst`, for each of the two products.
-pub(crate) fn poly_target_fft(
+pub(crate) fn poly_target_fft / poly_target_fft_v3 (
     logn: u32,
     t0: &mut [f64],
     t1: &mut [f64],
@@ -384,11 +484,13 @@ pub(crate) fn poly_target_fft(
         t0_im[j] = y_im * inv_q;
     }
 }
+}
 
+with_v3_copy! {
 /// SampPre's lattice point in one pass (fn-dsa lib.rs:673-689): `(z0, z1)` in `(t0, t1)` becomes
 /// `v0 = z0 b00 + z1 b10` in `t0` and `v1 = z1 b11 + z0 b01` in `t1`, with the operations of
 /// `poly_mul_fft` and `poly_add` and the operand order of fn-dsa's sequence.
-pub(crate) fn poly_lattice_point_fft(
+pub(crate) fn poly_lattice_point_fft / poly_lattice_point_fft_v3 (
     logn: u32,
     t0: &mut [f64],
     t1: &mut [f64],
@@ -415,6 +517,7 @@ pub(crate) fn poly_lattice_point_fft(
         t1_im[j] = d_im + c_im;
     }
 }
+}
 
 /// One node of ffSampling between its two recursive calls, fused into a single pass for
 /// `logn >= 2`: merge `z1` from the right subtree's output `(w0, w1)` into `t1` (whose old
@@ -433,6 +536,10 @@ pub(crate) fn merge_sub_mul_add_split(
     l10: &[f64],
 ) {
     debug_assert!(logn >= 2);
+    #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+    if logn >= 3 && crate::simd::fft_fused(logn, w, t0, t1, l10, &GM[1 << logn..3 << (logn - 1)]) {
+        return;
+    }
     let n = 1usize << logn;
     let hn = n >> 1;
     let qn = hn >> 1;
@@ -478,6 +585,49 @@ pub(crate) fn merge_sub_mul_add_split(
         let (u_re, u_im) = flc_mul(t_re, t_im, g_re, -g_im);
         w1_re[i] = u_re * 0.5;
         w1_im[i] = u_im * 0.5;
+    }
+}
+
+/// [`poly_split_fft`] in the x86-64-v3 copy of SampPre: the AVX2 kernel from `logn = 4` on.
+#[cfg(all(feature = "simd", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
+pub(crate) fn poly_split_fft_v3(logn: u32, f0: &mut [f64], f1: &mut [f64], f: &[f64]) {
+    if logn >= 4 {
+        let hn = 1usize << (logn - 1);
+        crate::simd::fft_avx2::poly_split_fft(logn, f0, f1, f, &GM[2 * hn..3 * hn]);
+    } else {
+        poly_split_fft(logn, f0, f1, f);
+    }
+}
+
+/// [`poly_merge_fft`] in the x86-64-v3 copy of SampPre: the AVX2 kernel from `logn = 4` on.
+#[cfg(all(feature = "simd", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
+pub(crate) fn poly_merge_fft_v3(logn: u32, f: &mut [f64], f0: &[f64], f1: &[f64]) {
+    if logn >= 4 {
+        let hn = 1usize << (logn - 1);
+        crate::simd::fft_avx2::poly_merge_fft(logn, f, f0, f1, &GM[2 * hn..3 * hn]);
+    } else {
+        poly_merge_fft(logn, f, f0, f1);
+    }
+}
+
+/// [`merge_sub_mul_add_split`] in the x86-64-v3 copy of SampPre: the AVX2 kernel from
+/// `logn = 4` on.
+#[cfg(all(feature = "simd", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
+pub(crate) fn merge_sub_mul_add_split_v3(
+    logn: u32,
+    w: &mut [f64],
+    t0: &[f64],
+    t1: &mut [f64],
+    l10: &[f64],
+) {
+    if logn >= 4 {
+        let hn = 1usize << (logn - 1);
+        crate::simd::fft_avx2::merge_sub_mul_add_split(logn, w, t0, t1, l10, &GM[2 * hn..3 * hn]);
+    } else {
+        merge_sub_mul_add_split(logn, w, t0, t1, l10);
     }
 }
 
@@ -774,6 +924,100 @@ mod tests {
 
     fn bits(v: &[f64]) -> Vec<u64> {
         v.iter().map(|x| x.to_bits()).collect()
+    }
+
+    /// fn-dsa's indexed FFT loop (poly.rs:196-230, portable branch), verbatim: the reference of
+    /// the layer functions.
+    fn fft_fndsa(logn: u32, f: &mut [f64]) {
+        let n = 1usize << logn;
+        let hn = n >> 1;
+        let mut t = hn;
+        for lm in 1..logn {
+            let m = 1usize << lm;
+            let hm = m >> 1;
+            let ht = t >> 1;
+            let mut j0 = 0;
+            for i in 0..hm {
+                let s_re = GM[(m + i) << 1];
+                let s_im = GM[((m + i) << 1) + 1];
+                for j in 0..ht {
+                    let j1 = j0 + j;
+                    let j2 = j1 + ht;
+                    let (x_re, x_im) = (f[j1], f[j1 + hn]);
+                    let (y_re, y_im) = (f[j2], f[j2 + hn]);
+                    let (z_re, z_im) = flc_mul(y_re, y_im, s_re, s_im);
+                    f[j1] = x_re + z_re;
+                    f[j1 + hn] = x_im + z_im;
+                    f[j2] = x_re - z_re;
+                    f[j2 + hn] = x_im - z_im;
+                }
+                j0 += t;
+            }
+            t = ht;
+        }
+    }
+
+    /// fn-dsa's indexed inverse FFT loop (poly.rs:428-467, portable branch), verbatim.
+    fn ifft_fndsa(logn: u32, f: &mut [f64]) {
+        let n = 1usize << logn;
+        let hn = n >> 1;
+        let mut t = 1usize;
+        for lm in 1..logn {
+            let hm = 1usize << (logn - lm);
+            let dt = t << 1;
+            let mut j0 = 0;
+            for i in 0..(hm >> 1) {
+                let s_re = GM[(hm + i) << 1];
+                let s_im = -GM[((hm + i) << 1) + 1];
+                for j in 0..t {
+                    let j1 = j0 + j;
+                    let j2 = j1 + t;
+                    let (x_re, x_im) = (f[j1], f[j1 + hn]);
+                    let (y_re, y_im) = (f[j2], f[j2 + hn]);
+                    f[j1] = x_re + y_re;
+                    f[j1 + hn] = x_im + y_im;
+                    let (z_re, z_im) = flc_mul(x_re - y_re, x_im - y_im, s_re, s_im);
+                    f[j2] = z_re;
+                    f[j2 + hn] = z_im;
+                }
+                j0 += dt;
+            }
+            t = dt;
+        }
+        let e = 1.0 / ((1u64 << (logn - 1)) as f64);
+        for x in f[..n].iter_mut() {
+            *x *= e;
+        }
+    }
+
+    /// The FFT and the inverse FFT (by blocks and lanes, and through the NEON kernels with the
+    /// `simd` feature on aarch64) equal fn-dsa's indexed loops bit for bit, at every size, on
+    /// random values and on signed zeros.
+    #[test]
+    fn fft_layers_bit_exact() {
+        let mut rng = Shake256Prng::new(b"fft-layers");
+        for logn in 1..=10u32 {
+            let n = 1usize << logn;
+            for round in 0..8 {
+                let mut f = vec![0.0; n];
+                rand_poly(&mut rng, &mut f);
+                if round == 0 {
+                    for (i, x) in f.iter_mut().enumerate() {
+                        if i % 5 == 0 {
+                            *x = if i % 2 == 0 { 0.0 } else { -0.0 };
+                        }
+                    }
+                }
+                let (mut a, mut b) = (f.clone(), f.clone());
+                fft(logn, &mut a);
+                fft_fndsa(logn, &mut b);
+                assert_eq!(bits(&a), bits(&b), "fft {logn}");
+                let (mut c, mut d) = (a.clone(), a.clone());
+                ifft(logn, &mut c);
+                ifft_fndsa(logn, &mut d);
+                assert_eq!(bits(&c), bits(&d), "ifft {logn}");
+            }
+        }
     }
 
     /// The chunked split and merge, and the fused node pass of ffSampling, equal their unfused

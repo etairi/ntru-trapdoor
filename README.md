@@ -44,11 +44,18 @@ ntru-trapdoor = "0.1"
 ```
 
 The optional `parallel` feature runs `samp_pre_batch` on all cores, through rayon:
-`ntru-trapdoor = { version = "0.1", features = ["parallel"] }`. The optional `simd`
-feature selects SIMD kernels at run time (AVX2 and BMI2 on x86-64, NEON on aarch64), with the
-same outputs, in the crate's only module with `unsafe` code. On x86-64, building with
-`RUSTFLAGS="-C target-cpu=x86-64-v3"` speeds up the rest as well, again with the same outputs
-(see [testing and benchmarks](docs/testing.md)).
+`ntru-trapdoor = { version = "0.1", features = ["parallel"] }`. The optional `simd` feature
+chooses SIMD kernels at run time, with the same outputs, in the crate's only module with
+`unsafe` code:
+- On x86-64, SampPre runs a copy of its code compiled for x86-64-v3 (AVX2, BMI1, BMI2, LZCNT
+  and POPCNT, no FMA) with AVX2 FFT passes. Keccak runs with AVX-512 or the x86-64-v3
+  instructions, and the NTT, the CRT and Verify with AVX-512F and AVX2.
+- On aarch64, the FFT passes, the NTT, the CRT and Verify run with NEON, and Keccak with the
+  SHA3 extension on Apple's processors.
+- `samp_pre_batch` derives the seeds of several calls and squeezes their PRNG streams
+  together, 8 at a time with AVX-512, 4 with AVX2 and 2 on Apple's processors.
+
+The environment variable `NTRU_TRAPDOOR_SCALAR` keeps the portable code.
 
 Without the `simd` feature the crate forbids `unsafe` code. Its only dependencies are `zeroize`
 and, for key generation, `num-bigint`, `num-integer` and `num-traits`.
@@ -124,18 +131,20 @@ Indicative medians on an Apple M4, one thread, rustc 1.100.0, release profile, w
 applications running. [Testing and benchmarks](docs/testing.md) has the full tables, an Intel
 Xeon (x86-64) table and the setup.
 
-| Operation | PCS | Falcon-1024 |
-|---|---|---|
-| key generation (`trapgen`) | 5.8 ms | 4.1 ms |
-| sampling tree (`ExpandedKey::new`) | 51 µs | 51 µs |
-| preimage (`samp_pre`) | 130 µs | 163 µs |
-| `verify` | 20 µs | 20 µs |
-| `R_q` multiplication / inversion | 27 µs / 55 µs | 27 µs / 54 µs |
+| Operation | PCS | Falcon-1024 | PCS, `simd` | Falcon-1024, `simd` |
+|---|---|---|---|---|
+| key generation (`trapgen`) | 5.9 ms | 4.1 ms | 5.8 ms | 4.0 ms |
+| sampling tree (`ExpandedKey::new`) | 52 µs | 52 µs | 49 µs | 49 µs |
+| preimage (`samp_pre`) | 133 µs | 163 µs | 130 µs | 157 µs |
+| `verify` | 20 µs | 20 µs | 9.3 µs | 9.4 µs |
+| `R_q` multiplication / inversion | 27 µs / 55 µs | 26 µs / 56 µs | 11 µs / 28 µs | 11 µs / 28 µs |
 
-With the `simd` feature (NEON), `verify` takes 11 µs, a multiplication 13 µs and an inversion
-35 µs. For comparison, fn-dsa 0.4.0 signs a Falcon-1024 message in 215 µs on the same machine.
-Sampling scales with threads that share one key: about 33,000 preimages per second on 8 threads
-at `Params::PCS`.
+On the Xeon, with `simd`, a preimage takes 204 µs at `Params::PCS` against 255 µs without it,
+and Verify 10.5 µs against 43 µs. For comparison, fn-dsa 0.4.0 signs a Falcon-1024 message in
+213 µs on the M4 and 434 µs on the Xeon, where this crate samples a Falcon-1024 preimage, tree
+included, in 203 µs and 326 µs with `simd`. Sampling scales with threads that share one key:
+about 36,000 preimages per second on 8 threads of the M4 at `Params::PCS` with `simd`, and
+`samp_pre_batch` runs 256 calls in 29 ms on one M4 core with `simd`.
 
 ## Documentation
 

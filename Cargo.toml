@@ -41,10 +41,13 @@ rayon = { version = "1.3", optional = true }
 [features]
 default = []
 parallel = ["dep:rayon"]
-# SIMD kernels chosen at run time on processors that have the instructions (x86-64: AVX2 for the
-# NTT, BMI1 and BMI2 for Keccak. aarch64: NEON for the NTT), with the same outputs as the
-# portable code. The one module that holds them (src/simd) may use unsafe code, and the rest of
-# the crate denies it. No effect on other architectures.
+# SIMD kernels chosen at run time on processors that have the instructions, with the same
+# outputs as the portable code. x86-64: SampPre through a copy compiled for x86-64-v3 with AVX2
+# FFT passes, Keccak with AVX-512 or the x86-64-v3 instructions, the NTT and its surroundings
+# with AVX-512F and AVX2. aarch64: NEON for the FFT passes and the NTT, the SHA3 extension for
+# Keccak on Apple's processors. samp_pre_batch also squeezes several PRNG streams together. The
+# one module that holds the kernels (src/simd) may use unsafe code, and the rest of the crate
+# denies it. No effect on other architectures.
 simd = []
 
 [dev-dependencies]

@@ -91,7 +91,13 @@ fn-dsa's). The following run in variable time:
 
 The `simd` feature (off by default) adds the crate's only `unsafe` code, in one module
 (`src/simd`): SIMD kernels chosen at run time, each with the same results as the portable code
-it replaces, which the tests compare.
+it replaces, which the tests compare. Like that code, the kernels do not branch on data and
+index no table by a secret value: the FFT passes run the portable floating-point operations
+lane by lane, and Keccak, the NTT and the reductions use bitwise operations, products and
+minima. On x86-64 SampPre runs a copy of its own code compiled for x86-64-v3, chosen once per
+process from the processor's features. `samp_pre_batch` squeezes the first blocks of the PRNG
+streams of several calls together and keeps them until the calls read them, then wipes them
+with the PRNG. How many blocks it squeezes depends only on the parameter set.
 
 The ring arithmetic uses masks; `inverse` reveals only whether an element is a unit.
 `PreparedRqPoly::mul_ternary` also reveals whether its operand is ternary, because it takes a

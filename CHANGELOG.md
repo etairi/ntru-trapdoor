@@ -7,27 +7,41 @@ All notable changes to this crate. The format follows
 ## [Unreleased]
 
 Faster, with the same outputs as 0.1.2: the known-answer tests and the fn-dsa parity tests pass
-unchanged, with and without the new feature.
+unchanged, with and without the new feature. Figures below are against 0.1.2 on an Intel Xeon
+8581C and an Apple M4.
 
 ### Added
 
 - The `simd` feature, off by default: SIMD kernels chosen at run time, in one module that may
-  use `unsafe` code (the rest of the crate denies it). On x86-64, AVX2 for the NTT and its
-  pointwise products, and Keccak compiled for BMI1 and BMI2. On aarch64, NEON for the NTT. The
-  environment variable `NTRU_TRAPDOOR_SCALAR` keeps the portable code. With it, a product in
-  `R_q` takes 42 % less time on an Intel Xeon 8581C and 52 % less on an Apple M4, and Verify
-  33 % and 45 % less.
+  use `unsafe` code (the rest of the crate denies it). The environment variable
+  `NTRU_TRAPDOOR_SCALAR` keeps the portable code.
+  - x86-64: SampPre runs a copy of its code compiled for x86-64-v3 (AVX2, BMI1, BMI2, LZCNT and
+    POPCNT, without FMA), with AVX2 kernels for its FFT passes. Keccak runs with AVX-512, else
+    compiled for x86-64-v3. The NTT runs with AVX-512F and AVX2, and so do the CRT, the
+    reductions modulo `q`, the norm of the inversion tower, the check of the NTRU equation and
+    Verify's norm and final comparison.
+  - aarch64: NEON for the FFT passes, the NTT and the same code around it, and the SHA3
+    extension for Keccak on Apple's processors.
+  - `samp_pre_batch` derives the seeds of several calls together and squeezes the first blocks
+    of their PRNG streams together, 8 streams at a time with AVX-512, 4 with AVX2 and 2 on
+    Apple's processors. Each call still reads its own stream.
+  - With it, on the Xeon, SampPre takes 30 % less time at `Params::PCS` and 28 % less at
+    Falcon-1024, Verify 76 % less, a product in `R_q` 73 % less and a batch of 256 calls 43 %
+    less. On the M4: 14 %, 14 %, 53 %, 56 % and 19 % less.
 
 ### Changed
 
-- SampPre is faster, by 10 % at `Params::PCS` and 6 % at Falcon-1024 on the Xeon, and by 7 to
-  8 % on the M4.
+- SampPre is faster without the feature too: 12 % at `Params::PCS` and 13 % at Falcon-1024 on
+  the Xeon, 9 % and 10 % on the M4.
   - The Bernoulli step decides its first byte from an `f64` estimate of the threshold and
     computes FACCT's polynomial only in 2 of 256 trials, with the same result and the same PRNG
-    bytes (a lemma, recorded in the sampler's documentation).
+    bytes (a lemma, recorded in the sampler's documentation). That byte is compared with the
+    estimate in floating point, without a conversion to an integer.
   - ffSampling's nodes of degree 4 are unrolled.
+  - fn-dsa's base sampler reads its table by columns, which the compiler vectorizes: the same
+    comparison on every row.
 - `RqPoly::to_bytes` and `PublicKey::to_bytes` write 32 bits at a time: 2.4 times faster on the
-  M4 and 2.9 times on the Xeon, with the same bytes.
+  M4 and 2.7 times on the Xeon, with the same bytes.
 
 ## [0.1.2] - 2026-11-19
 

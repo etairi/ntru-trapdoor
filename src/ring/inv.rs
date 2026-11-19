@@ -52,6 +52,10 @@ impl Drop for Level {
 fn norm_ntt(pr: &NttPrime, logh: u32, e: &[u32], o: &[u32]) -> Vec<u32> {
     let h = 1usize << logh;
     let mut out = vec![0u32; h];
+    #[cfg(all(feature = "simd", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    if crate::simd::norm_ntt(pr, logh, e, o, &mut out) {
+        return out;
+    }
     // mmul(mmul(a, b), c) = ab / h: the plain product with 1/h folded in (`NttPrime::mul` uses
     // 2^64 mod p here).
     let c = pr.ninv_r2[logh as usize];
@@ -88,11 +92,7 @@ fn descend(mq: &ModQ, logh: u32, a: &[u32]) -> (Vec<u32>, Level) {
     let mut n2 = norm_ntt(&P2, logh, &e2, &o2);
     P1.intt_n(logh, &mut n1);
     P2.intt_n(logh, &mut n2);
-    let norm: Vec<u32> = n1
-        .iter()
-        .zip(n2.iter())
-        .map(|(&u1, &u2)| mq.crt(u1, u2))
-        .collect();
+    let norm = crt_vec(mq, &n1, &n2);
     n1.as_mut_slice().zeroize();
     n2.as_mut_slice().zeroize();
     (
@@ -105,6 +105,21 @@ fn descend(mq: &ModQ, logh: u32, a: &[u32]) -> (Vec<u32>, Level) {
             o2,
         },
     )
+}
+
+/// `mq.crt(u1[i], u2[i])` for every `i`, with a kernel when the `simd` feature has one.
+fn crt_vec(mq: &ModQ, u1: &[u32], u2: &[u32]) -> Vec<u32> {
+    #[cfg(all(feature = "simd", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        let mut out = vec![0u32; u1.len()];
+        if crate::simd::crt_slices(mq.q(), u1, u2, &mut out, false) {
+            return out;
+        }
+    }
+    u1.iter()
+        .zip(u2.iter())
+        .map(|(&a, &b)| mq.crt(a, b))
+        .collect()
 }
 
 /// $`-x \bmod q`$ for $`x\in[0,q)`$.
@@ -211,9 +226,27 @@ pub(crate) fn invert(logn: u32, q: u32, a: &[u32]) -> Option<Vec<u32>> {
         P2.intt_n(logh, &mut pe2);
         P2.intt_n(logh, &mut po2);
         let mut out = vec![0u32; 2 * h];
-        for i in 0..h {
-            out[2 * i] = mq.crt(pe1[i], pe2[i]);
-            out[2 * i + 1] = neg_mod(mq.crt(po1[i], po2[i]), q);
+        // With the `simd` feature, the CRT of both halves into the spent i1, i2, then
+        // interleaved. The portable code keeps one pass (two passes measured 4 % slower).
+        #[cfg(all(feature = "simd", any(target_arch = "x86_64", target_arch = "aarch64")))]
+        let done = crate::simd::crt_slices(q, &pe1, &pe2, &mut i1, false)
+            && crate::simd::crt_slices(q, &po1, &po2, &mut i2, false);
+        #[cfg(not(all(feature = "simd", any(target_arch = "x86_64", target_arch = "aarch64"))))]
+        let done = false;
+        if done {
+            for (pair, (&e, &o)) in out
+                .as_chunks_mut::<2>()
+                .0
+                .iter_mut()
+                .zip(i1.iter().zip(i2.iter()))
+            {
+                *pair = [e, neg_mod(o, q)];
+            }
+        } else {
+            for i in 0..h {
+                out[2 * i] = mq.crt(pe1[i], pe2[i]);
+                out[2 * i + 1] = neg_mod(mq.crt(po1[i], po2[i]), q);
+            }
         }
         for v in [&mut i1, &mut i2, &mut pe1, &mut po1, &mut pe2, &mut po2] {
             v.as_mut_slice().zeroize();

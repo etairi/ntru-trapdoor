@@ -36,7 +36,7 @@ pub trait Prng {
 const RATE: usize = 136;
 
 /// Keccak-f\[1600\] round constants (fn-dsa-comm/src/shake.rs:20-33).
-const RC: [u64; 24] = [
+pub(crate) const RC: [u64; 24] = [
     0x0000000000000001,
     0x0000000000008082,
     0x800000000000808A,
@@ -64,8 +64,8 @@ const RC: [u64; 24] = [
 ];
 
 /// The body of the Keccak-f\[1600\] permutation, shared by [`keccak_f1600_portable`] and its
-/// copy compiled for BMI1 and BMI2 (the `simd` feature on x86-64): one source, two
-/// compilations, the same results.
+/// copy compiled for AVX2, BMI1, BMI2, LZCNT and POPCNT (the `simd` feature on x86-64): one
+/// source, two compilations, the same results.
 #[rustfmt::skip]
 macro_rules! keccak_f1600_body {
     ($state:ident) => {{
@@ -499,11 +499,13 @@ macro_rules! keccak_f1600_body {
 ///
 /// Verbatim port of fn-dsa `KeccakState::process` (fn-dsa-comm/src/shake.rs:40-461): the
 /// lane-complementing representation, 24 rounds unrolled two per loop iteration. With the
-/// `simd` feature on x86-64 the same code compiled for BMI1 and BMI2 (`andn`, `rorx`) runs on
-/// processors that have them.
+/// `simd` feature a kernel with the same results runs instead on processors that have the
+/// instructions (module `simd`): on x86-64 AVX-512, else the same code compiled for AVX2, BMI1,
+/// BMI2, LZCNT and POPCNT (`andn`, `rorx`), and on Apple's aarch64 processors the SHA3
+/// extension.
 #[inline]
 fn keccak_f1600(state: &mut [u64; 25]) {
-    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+    #[cfg(all(feature = "simd", any(target_arch = "x86_64", target_arch = "aarch64")))]
     if crate::simd::keccak_f1600(state) {
         return;
     }
@@ -523,8 +525,10 @@ pub(crate) fn keccak_f1600_portable(state: &mut [u64; 25]) {
     keccak_f1600_body!(state)
 }
 
-/// [`keccak_f1600_portable`] compiled for BMI1 and BMI2; called by `simd::keccak_f1600` on
-/// processors that have them.
+/// [`keccak_f1600_portable`] compiled for AVX2, BMI1, BMI2, LZCNT and POPCNT (the integer
+/// features of x86-64-v3), which `simd::keccak_f1600` calls on processors that have them and not
+/// AVX-512. The rounds use `andn` and `rorx`, and AVX2 copies and wipes the state 32 bytes at a
+/// time: 4 % faster than with BMI1 and BMI2 alone on a Xeon 8581C.
 #[cfg(all(feature = "simd", target_arch = "x86_64"))]
 #[allow(
     non_snake_case,
@@ -533,7 +537,7 @@ pub(crate) fn keccak_f1600_portable(state: &mut [u64; 25]) {
     clippy::manual_rotate
 )]
 #[rustfmt::skip]
-#[target_feature(enable = "bmi1,bmi2")]
+#[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
 pub(crate) fn keccak_f1600_bmi(state: &mut [u64; 25]) {
     keccak_f1600_body!(state)
 }
@@ -631,12 +635,19 @@ impl Drop for Shake256 {
 /// seed, read through a 136-byte buffer. Wiped on drop.
 #[derive(Clone)]
 pub struct Shake256Prng {
-    /// The Keccak state, after the absorb phase and the padding.
+    /// The Keccak state, after the absorb phase and the padding, and after the permutations of
+    /// the blocks squeezed so far (those of `pre` included).
     state: [u64; 25],
     /// The current squeezed block.
     buf: [u8; RATE],
     /// Read position in `buf`; `RATE` means empty.
     ptr: usize,
+    /// The first blocks of the stream, squeezed ahead together with other streams
+    /// ([`squeeze_streams`]): the refills take them, in order, before they permute `state`.
+    /// Empty otherwise.
+    pre: Vec<u8>,
+    /// The next block of `pre`, in bytes.
+    pre_at: usize,
 }
 
 impl Shake256Prng {
@@ -656,6 +667,8 @@ impl Shake256Prng {
             state: sh.state,
             buf: [0u8; RATE],
             ptr: RATE,
+            pre: Vec::new(),
+            pre_at: 0,
         }
     }
 
@@ -669,10 +682,17 @@ impl Shake256Prng {
     #[cold]
     #[inline(never)]
     fn refill(&mut self) {
-        keccak_f1600(&mut self.state);
-        let (chunks, _) = self.buf.as_chunks_mut::<8>();
-        for (chunk, lane) in chunks.iter_mut().zip(self.state.iter()) {
-            *chunk = lane.to_le_bytes();
+        if self.pre_at < self.pre.len() {
+            // A block squeezed ahead (`squeeze_streams`): the one this permutation would give.
+            self.buf
+                .copy_from_slice(&self.pre[self.pre_at..self.pre_at + RATE]);
+            self.pre_at += RATE;
+        } else {
+            keccak_f1600(&mut self.state);
+            let (chunks, _) = self.buf.as_chunks_mut::<8>();
+            for (chunk, lane) in chunks.iter_mut().zip(self.state.iter()) {
+                *chunk = lane.to_le_bytes();
+            }
         }
         self.ptr = 0;
     }
@@ -767,8 +787,153 @@ impl Drop for Shake256Prng {
     fn drop(&mut self) {
         self.state.zeroize();
         self.buf.zeroize();
+        self.pre.as_mut_slice().zeroize();
         self.ptr = RATE;
     }
+}
+
+/// The number of independent Keccak states that a multi-state kernel of this processor
+/// permutes at once (8, 4 or 2), or 1 without one. On aarch64 only Apple's processors count:
+/// the two-state SHA3 kernel takes 83 ns per state against 165 ns for one state on an M4, but
+/// 261 ns against 293 ns for the portable code on a Neoverse V2, where `samp_pre_batch` was
+/// faster call by call.
+pub(crate) fn keccak_lanes() -> usize {
+    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+    {
+        if crate::simd::avx512() {
+            return 8;
+        }
+        if crate::simd::avx2() {
+            return 4;
+        }
+    }
+    #[cfg(all(feature = "simd", target_arch = "aarch64", target_vendor = "apple"))]
+    if crate::simd::sha3() {
+        return 2;
+    }
+    1
+}
+
+/// Keccak-f\[1600\] on every state, with the multi-state kernels where they apply (groups of 8,
+/// 4 or 2) and one state at a time for the rest: each state as [`keccak_f1600`] permutes it.
+fn keccak_many(states: &mut [[u64; 25]]) {
+    #[cfg(feature = "simd")]
+    let states = keccak_many_simd(states);
+    states.iter_mut().for_each(keccak_f1600);
+}
+
+/// The groups of [`keccak_many`] that a multi-state kernel takes: returns the states left over.
+#[cfg(feature = "simd")]
+fn keccak_many_simd(states: &mut [[u64; 25]]) -> &mut [[u64; 25]] {
+    let lanes = keccak_lanes();
+    let mut rest = states;
+    if lanes == 8 {
+        let (groups, tail) = rest.as_chunks_mut::<8>();
+        for g in groups {
+            if !crate::simd::keccak_f1600_x8(g) {
+                g.iter_mut().for_each(keccak_f1600);
+            }
+        }
+        rest = tail;
+    }
+    if lanes >= 4 {
+        let (groups, tail) = rest.as_chunks_mut::<4>();
+        for g in groups {
+            if !crate::simd::keccak_f1600_x4(g) {
+                g.iter_mut().for_each(keccak_f1600);
+            }
+        }
+        rest = tail;
+    }
+    if lanes == 2 {
+        let (groups, tail) = rest.as_chunks_mut::<2>();
+        for g in groups {
+            if !crate::simd::keccak_f1600_x2(g) {
+                g.iter_mut().for_each(keccak_f1600);
+            }
+        }
+        rest = tail;
+    }
+    rest
+}
+
+/// SHAKE256 of several messages of the same length at once: absorbs them in step (one
+/// multi-state permutation per block, [`keccak_many`]), pads them, then squeezes `blocks` blocks
+/// of each. Returns the states after the last permutation and the squeezed bytes, `blocks * 136`
+/// per message: for each message, what [`Shake256`] and [`Shake256Prng`] compute one block at a
+/// time. Panics if the lengths differ.
+fn shake256_many(msgs: &[&[u8]], blocks: usize) -> (Vec<[u64; 25]>, Vec<Vec<u8>>) {
+    let len = msgs.first().map_or(0, |m| m.len());
+    assert!(msgs.iter().all(|m| m.len() == len));
+    let mut states = vec![[0u64; 25]; msgs.len()];
+    // Absorb: the full blocks, each followed by a permutation (as `Shake256::inject`).
+    let full = len / RATE;
+    for b in 0..full {
+        for (st, m) in states.iter_mut().zip(msgs) {
+            let (lanes, _) = m[b * RATE..(b + 1) * RATE].as_chunks::<8>();
+            for (a, l) in st.iter_mut().zip(lanes) {
+                *a ^= u64::from_le_bytes(*l);
+            }
+        }
+        keccak_many(&mut states);
+    }
+    // The rest of the message and the padding (as `Shake256::inject` and `Shake256::flip`).
+    for (st, m) in states.iter_mut().zip(msgs) {
+        for (i, &x) in m[full * RATE..].iter().enumerate() {
+            st[i >> 3] ^= (x as u64) << ((i & 7) << 3);
+        }
+        let i = len - full * RATE;
+        st[i >> 3] ^= 0x1Fu64 << ((i & 7) << 3);
+        st[(RATE - 1) >> 3] ^= 0x80u64 << (((RATE - 1) & 7) << 3);
+    }
+    // Squeeze: a permutation, then the rate, per block (as `Shake256Prng::refill`).
+    let mut out = vec![vec![0u8; blocks * RATE]; msgs.len()];
+    for b in 0..blocks {
+        keccak_many(&mut states);
+        for (st, o) in states.iter().zip(out.iter_mut()) {
+            let (chunks, _) = o[b * RATE..(b + 1) * RATE].as_chunks_mut::<8>();
+            for (c, lane) in chunks.iter_mut().zip(st.iter()) {
+                *c = lane.to_le_bytes();
+            }
+        }
+    }
+    (states, out)
+}
+
+/// [`shake256`] of several inputs of the same length at once, `N` bytes of output each
+/// (`N <= 136`), with the multi-state kernels.
+pub(crate) fn shake256_parallel<const N: usize>(msgs: &[&[u8]]) -> Vec<[u8; N]> {
+    const { assert!(N <= RATE) };
+    let (mut states, mut blocks) = shake256_many(msgs, 1);
+    let out = blocks
+        .iter()
+        .map(|b| core::array::from_fn(|i| b[i]))
+        .collect();
+    for st in states.iter_mut() {
+        st.zeroize();
+    }
+    for b in blocks.iter_mut() {
+        b.as_mut_slice().zeroize();
+    }
+    out
+}
+
+/// The streams SHAKE256(`seeds[i]`) (seeds of the same length), with their first `blocks`
+/// blocks squeezed together by the multi-state kernels: each PRNG returns the bytes of
+/// `Shake256Prng::new(seeds[i])`, the first ones from the blocks squeezed ahead.
+pub(crate) fn squeeze_streams(seeds: &[&[u8]], blocks: usize) -> Vec<Shake256Prng> {
+    let (states, pre) = shake256_many(seeds, blocks);
+    states
+        .into_iter()
+        .zip(pre)
+        .map(|(state, pre)| Shake256Prng {
+            state,
+            buf: [0u8; RATE],
+            ptr: RATE,
+            pre,
+            pre_at: 0,
+        })
+        .collect()
 }
 
 /// SHAKE256 of the concatenation of `parts`, `out.len()` bytes of output.
@@ -953,6 +1118,55 @@ mod tests {
                 }
             }
             k += 1;
+        }
+    }
+
+    /// SHAKE256 of several messages at once (`shake256_parallel`) equals `shake256` of each,
+    /// at lengths around the rate (0, 1, 135, 136, 137, 272) and of the seed derivation, for
+    /// 1 to 9 messages (every group size of the multi-state kernels, and remainders).
+    #[test]
+    fn shake256_parallel_equals_shake256() {
+        let mut rng = Shake256Prng::new(b"shake-parallel");
+        for len in [0usize, 1, 64, 65, 135, 136, 137, 272, 2649] {
+            for count in 1..=9usize {
+                let msgs: Vec<Vec<u8>> = (0..count)
+                    .map(|_| (0..len).map(|_| rng.next_u8()).collect())
+                    .collect();
+                let refs: Vec<&[u8]> = msgs.iter().map(|m| m.as_slice()).collect();
+                let got = shake256_parallel::<64>(&refs);
+                for (m, g) in msgs.iter().zip(got.iter()) {
+                    let mut want = [0u8; 64];
+                    shake256(&[m], &mut want);
+                    assert_eq!(*g, want, "length {len}, {count} messages");
+                }
+            }
+        }
+    }
+
+    /// The streams with their first blocks squeezed together (`squeeze_streams`) are the
+    /// streams of `Shake256Prng::new`, inside the squeezed blocks and after them, whatever the
+    /// reads (a block boundary is crossed by 8-byte reads at every alignment).
+    #[test]
+    fn squeezed_streams_equal_prng() {
+        let mut rng = Shake256Prng::new(b"squeeze-streams");
+        for count in [1usize, 2, 3, 4, 5, 8, 9] {
+            let seeds: Vec<[u8; 65]> = (0..count)
+                .map(|_| core::array::from_fn(|_| rng.next_u8()))
+                .collect();
+            let refs: Vec<&[u8]> = seeds.iter().map(|s| s.as_slice()).collect();
+            for blocks in [0usize, 1, 3] {
+                let prngs = squeeze_streams(&refs, blocks);
+                for (seed, mut p) in seeds.iter().zip(prngs) {
+                    let mut q = Shake256Prng::new(seed);
+                    for k in 0..200usize {
+                        match k % 3 {
+                            0 => assert_eq!(p.next_u64(), q.next_u64()),
+                            1 => assert_eq!(p.next_u8(), q.next_u8()),
+                            _ => assert_eq!(p.next_u16(), q.next_u16()),
+                        }
+                    }
+                }
+            }
         }
     }
 

@@ -23,9 +23,11 @@
 //!   and the full 192-bit comparison decides. The distribution is exactly that of the 192-bit
 //!   table; a draw takes 8 PRNG bytes (25 in the rare fallback). The fallback's branch leaks
 //!   only that rare event.
-//! - `Falcon1_8205`: fn-dsa's `gaussian0` verbatim (one `next_u64`, one `next_u16`, the
-//!   31+24+24-bit limb comparison over [`crate::tables::GAUSS0_1_8205_79`], which equals fn-dsa's
-//!   `GAUSS0`).
+//! - `Falcon1_8205`: fn-dsa's `gaussian0` (one `next_u64`, one `next_u16`, and the 31+24+24-bit
+//!   limb comparison with every row of [`crate::tables::GAUSS0_1_8205_79`], which equals fn-dsa's
+//!   `GAUSS0`). The rows are read through a copy of the table by columns, padded with zero rows
+//!   that never count, so that the compiler vectorizes the scan: the same comparisons, so the
+//!   same count.
 //!
 //! The base is dispatched once per leaf draw (one perfectly predictable branch), into a loop
 //! that is monomorphised per base: there is no branch per trial.
@@ -50,7 +52,9 @@
 //! decided otherwise: an `f64` estimate $`f`$ of $`z/2^{56}`$ (a degree-5 Taylor polynomial of
 //! $`e^{-u}`$ around $`\ln2/2`$) gives $`m=\min(254,\max(0,\lfloor f-1/32\rfloor))`$, a first
 //! byte below $`m`$ accepts, one above $`m+1`$ rejects, and $`m`$ or $`m+1`$ (2 of 256 trials)
-//! run the exact comparison from that byte on. For $`x\ge0`$ and $`1/2\le ccs\le1`$,
+//! run the exact comparison from that byte on (the comparisons with $`m`$ are taken on
+//! $`\max(f-1/32,0)`$ in floating point, which gives the same three outcomes without a
+//! conversion to an integer). For $`x\ge0`$ and $`1/2\le ccs\le1`$,
 //! $`|f-z/2^{56}|\le6.2\cdot10^{-4}`$, so $`\lfloor z/2^{56}\rfloor\in\{m,m+1\}`$, and the
 //! result and the bytes read are those of `ber_exp` (lemma of the 2026-11-18 study: a paper
 //! proof whose numerical steps are certified with interval arithmetic, the window logic checked
@@ -108,7 +112,7 @@ impl<'a, P: Prng> SamplerZ<'a, P> {
     }
 
     /// fn-dsa `Sampler::next` (sampler.rs:131-192), with the base `B`.
-    #[inline]
+    #[inline(always)]
     fn next<B: BaseGauss>(&mut self, mu: f64, isigma: f64) -> i32 {
         // Centre mu = s + r, s integer, 0 <= r < 1 (FLR::floor, flr_native.rs:437-480).
         let s = mu.floor() as i64;
@@ -156,6 +160,34 @@ impl<P: Prng> LeafSampler for SamplerZ<'_, P> {
             BaseSampler::HalfGauss3_1 => self.next::<HalfGauss31>(mu, isigma),
             BaseSampler::Falcon1_8205 => self.next::<Falcon18205>(mu, isigma),
         }
+    }
+}
+
+#[cfg(all(feature = "simd", target_arch = "x86_64"))]
+impl<P: Prng> SamplerZ<'_, P> {
+    /// [`LeafSampler::sample`] compiled for x86-64-v3 (AVX2, BMI1, BMI2, LZCNT, POPCNT, no FMA),
+    /// with the trial loop, the base draws and the PRNG reads inside it: the same operations, so
+    /// the same results and the same bytes. SampPre calls it on processors that have the
+    /// instructions (sign.rs).
+    #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
+    pub(crate) fn sample_v3(&mut self, mu: f64, isigma: f64) -> i32 {
+        match self.params.base {
+            BaseSampler::HalfGauss3_1 => self.next::<HalfGauss31>(mu, isigma),
+            BaseSampler::Falcon1_8205 => self.next::<Falcon18205>(mu, isigma),
+        }
+    }
+}
+
+/// A leaf sampler from a closure: lets a function compiled with more instructions pass a call
+/// of its own compilation (`SamplerZ::sample_v3`) to the generic ffSampling.
+#[cfg(all(feature = "simd", target_arch = "x86_64"))]
+pub(crate) struct FnSampler<F>(pub(crate) F);
+
+#[cfg(all(feature = "simd", target_arch = "x86_64"))]
+impl<F: FnMut(f64, f64) -> i32> LeafSampler for FnSampler<F> {
+    #[inline(always)]
+    fn sample(&mut self, mu: f64, isigma: f64) -> i32 {
+        (self.0)(mu, isigma)
     }
 }
 
@@ -251,26 +283,55 @@ impl BaseGauss for HalfGauss31 {
 /// Width 1.8205, fn-dsa's 79-bit `GAUSS0` ([`tables::GAUSS0_1_8205_79`]).
 struct Falcon18205;
 
+/// The rows of [`tables::GAUSS0_1_8205_79`] padded with zero rows to a multiple of 8.
+const GAUSS0_ROWS: usize = tables::GAUSS0_1_8205_79.len().next_multiple_of(8);
+
+/// The columns of [`tables::GAUSS0_1_8205_79`] (the 31-bit high limbs, then the two 24-bit
+/// limbs), padded with zero rows to [`GAUSS0_ROWS`].
+const GAUSS0_COLS: [[u32; GAUSS0_ROWS]; 3] = {
+    let t = &tables::GAUSS0_1_8205_79;
+    let mut c = [[0u32; GAUSS0_ROWS]; 3];
+    let mut i = 0;
+    while i < t.len() {
+        c[0][i] = t[i][0];
+        c[1][i] = t[i][1];
+        c[2][i] = t[i][2];
+        i += 1;
+    }
+    c
+};
+
 impl BaseGauss for Falcon18205 {
     const INV_2SQRSIGMA0: f64 = BaseSampler::Falcon1_8205.inv_2sqr_sigma0();
 
-    /// fn-dsa `gaussian0` (sampler.rs:241-260), verbatim.
+    /// fn-dsa `gaussian0` (sampler.rs:241-260).
     #[inline(always)]
     fn draw<P: Prng>(prng: &mut P) -> (i32, i32) {
-        // 80 random bits: the low bit is the sign, then three limbs of 24 bits.
         let lo = prng.next_u64();
         let hi = prng.next_u16();
+        Self::limbs(lo, hi)
+    }
+}
+
+impl Falcon18205 {
+    /// The table comparison of fn-dsa's `gaussian0` on the 80 bits `lo`, `hi`.
+    #[inline(always)]
+    fn limbs(lo: u64, hi: u16) -> (i32, i32) {
+        // 80 random bits: the low bit is the sign, then three limbs of 24 bits.
         let b = (lo as i32) & 1;
         let v0 = ((lo as u32) >> 1) & 0x00FF_FFFF;
         let v1 = ((lo >> 25) as u32) & 0x00FF_FFFF;
         let v2 = ((lo >> 49) as u32) | ((hi as u32) << 15);
 
-        // z = number of table rows above (v2, v1, v0).
+        // z = number of table rows above (v2, v1, v0): fn-dsa's comparison on each row, over the
+        // columns of the table (GAUSS0_COLS), which the compiler can vectorize. The padding rows
+        // are zero and never count: v0, v1 < 2^24 and v2 < 2^31.
         let mut z = 0i32;
-        for row in tables::GAUSS0_1_8205_79.iter() {
-            let cc = v0.wrapping_sub(row[2]) >> 31;
-            let cc = v1.wrapping_sub(row[1]).wrapping_sub(cc) >> 31;
-            let cc = v2.wrapping_sub(row[0]).wrapping_sub(cc) >> 31;
+        let [c0, c1, c2] = &GAUSS0_COLS;
+        for ((&t0, &t1), &t2) in c0.iter().zip(c1.iter()).zip(c2.iter()) {
+            let cc = v0.wrapping_sub(t2) >> 31;
+            let cc = v1.wrapping_sub(t1).wrapping_sub(cc) >> 31;
+            let cc = v2.wrapping_sub(t0).wrapping_sub(cc) >> 31;
             z += cc as i32;
         }
         (z, b)
@@ -341,16 +402,28 @@ fn ber_exp_shortcut<P: Prng>(prng: &mut P, x: f64, ccs: f64) -> bool {
         0.0
     };
     let w0 = prng.next_u8();
-    let fl = f - DELTA;
-    let m = if fl < 0.0 { 0 } else { (fl as u32).min(254) };
-    let w = w0 as u32;
-    if w < m {
+    let (accept, reject) = first_byte_decision(f - DELTA, w0);
+    if accept {
         return true;
     }
-    if w > m + 1 {
+    if reject {
         return false;
     }
     ber_exp_from(prng, w0, x, ccs)
+}
+
+/// The decision of the first Bernoulli byte `w` against the window
+/// $`m=\min(254,\max(0,\lfloor f_l\rfloor))`$, $`f_l=f-1/32\ge-1/32`$: accept when $`w<m`$,
+/// reject when $`w>m+1`$, and neither (the exact comparison) otherwise. Computed on
+/// $`g=\max(f_l,0)`$ without forming $`m`$: for integers $`w`$, $`w<\lfloor g\rfloor`$ is
+/// $`w+1\le g`$, and $`w>\min(254,\lfloor g\rfloor)+1`$ is $`g<w-1`$ (both sides false when
+/// $`\lfloor g\rfloor\ge254`$, since $`w\le255`$), so the float-to-integer conversion leaves
+/// the chain of dependent operations (test `first_byte_decision_equals_window`).
+#[inline(always)]
+fn first_byte_decision(fl: f64, w: u8) -> (bool, bool) {
+    let g = fl.max(0.0);
+    let wf = w as f64;
+    ((w < 254) & (wf + 1.0 <= g), g < wf - 1.0)
 }
 
 /// [`ber_exp`] from an already read first byte `w0`: the exact threshold, then the lazy
@@ -505,6 +578,48 @@ mod tests {
         let mut p = Bytes((0..=255u8).cycle().take(4096).collect(), 0);
         let _ = Falcon18205::draw(&mut p);
         assert_eq!(p.1, BaseSampler::Falcon1_8205.bytes_per_draw());
+    }
+
+    /// The scan of fn-dsa's table by columns (with zero padding rows) gives the count of
+    /// fn-dsa's row-by-row loop (sampler.rs:241-260, verbatim below), on random 80-bit draws and
+    /// on draws just below, at and above every row.
+    #[test]
+    fn gauss0_columns_equal_rows() {
+        let rows = |lo: u64, hi: u16| -> (i32, i32) {
+            let b = (lo as i32) & 1;
+            let v0 = ((lo as u32) >> 1) & 0x00FF_FFFF;
+            let v1 = ((lo >> 25) as u32) & 0x00FF_FFFF;
+            let v2 = ((lo >> 49) as u32) | ((hi as u32) << 15);
+            let mut z = 0i32;
+            for row in tables::GAUSS0_1_8205_79.iter() {
+                let cc = v0.wrapping_sub(row[2]) >> 31;
+                let cc = v1.wrapping_sub(row[1]).wrapping_sub(cc) >> 31;
+                let cc = v2.wrapping_sub(row[0]).wrapping_sub(cc) >> 31;
+                z += cc as i32;
+            }
+            (z, b)
+        };
+        let mut rng = Shake256Prng::new(b"gauss0-columns");
+        for _ in 0..200_000 {
+            let (lo, hi) = (rng.next_u64(), rng.next_u16());
+            assert_eq!(Falcon18205::limbs(lo, hi), rows(lo, hi));
+        }
+        // The 79-bit value V = v2 * 2^48 + v1 * 2^24 + v0 next to every row.
+        for row in tables::GAUSS0_1_8205_79.iter() {
+            let t = ((row[0] as u128) << 48) | ((row[1] as u128) << 24) | row[2] as u128;
+            for d in [-2i128, -1, 0, 1, 2] {
+                let v = (t as i128 + d).clamp(0, (1i128 << 79) - 1) as u128;
+                for sign in 0..2u64 {
+                    let lo = ((v as u64) << 1) | sign;
+                    let hi = (v >> 63) as u16;
+                    assert_eq!(
+                        Falcon18205::limbs(lo, hi),
+                        rows(lo, hi),
+                        "row {row:?} d {d}"
+                    );
+                }
+            }
+        }
     }
 
     /// The trimmed scan's constants: the entries with nonzero top bits form a prefix of 28, and
@@ -750,6 +865,34 @@ mod tests {
         let r = x - (s as f64) * LOG2;
         let keep = (s.wrapping_sub(64) >> 63) as u64;
         ((expm_p63(r, ccs) << 1).wrapping_sub(1) >> ((s as u32) & 63)) & keep
+    }
+
+    /// The decision of `first_byte_decision` is the window's: `w < m` accepts and `w > m + 1`
+    /// rejects, for `m = clamp(floor(f_l), 0, 254)` (the integer form that it replaces), for
+    /// every byte and for `f_l` at, just below and just above every integer from -1 to 257, at
+    /// -1/32, and at random values in [-1/32, 260).
+    #[test]
+    fn first_byte_decision_equals_window() {
+        let mut fls: Vec<f64> = vec![-1.0 / 32.0, -0.0, 0.0, 5e-324];
+        for k in -1..=257i32 {
+            let v = k as f64;
+            fls.extend([v, v.next_down(), v.next_up(), v - 1e-9, v + 1e-9, v + 0.5]);
+        }
+        let mut rng = Shake256Prng::new(b"first-byte-decision");
+        for _ in 0..20_000 {
+            let u = (rng.next_u64() >> 11) as f64 / (1u64 << 53) as f64;
+            fls.push(u * 260.03125 - 1.0 / 32.0);
+        }
+        for &fl in &fls {
+            if fl < -1.0 / 32.0 {
+                continue;
+            }
+            let m = if fl < 0.0 { 0 } else { (fl as u32).min(254) };
+            for w in 0..=255u8 {
+                let want = ((w as u32) < m, (w as u32) > m + 1);
+                assert_eq!(first_byte_decision(fl, w), want, "fl {fl:e} w {w}");
+            }
+        }
     }
 
     /// `ber_exp_shortcut` returns what `ber_exp` returns and reads the same bytes: random inputs

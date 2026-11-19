@@ -330,64 +330,91 @@ fn for_each_leaf(logn: u32, tree: &[f64], f: &mut impl FnMut(f64)) {
     for_each_leaf(logn - 1, &tree[n + sub..n + 2 * sub], f);
 }
 
-/// Fast Fourier sampling over the tree (fn-dsa `ffsamp_fft_inner`, sampler.rs:505-635, with
-/// tree lookups): on input the target `(t0, t1)` (FFT representation), on output the sampled
-/// `(z0, z1)` (FFT representation). `tmp` needs `2n` values.
-#[inline]
-pub(crate) fn ffsampling<S: LeafSampler>(
-    samp: &mut S,
-    logn: u32,
-    t0: &mut [f64],
-    t1: &mut [f64],
-    tree: &[f64],
-    tmp: &mut [f64],
-) {
-    if logn == 1 {
-        // sampler.rs:527-557. t1's split is trivial: w0 = t1[0], w1 = t1[1].
-        let (l01_re, l01_im, leaf_r, leaf_l) = (tree[0], tree[1], tree[2], tree[3]);
-        let w0 = t1[0];
-        let w1 = t1[1];
-        let y0 = samp.sample(w0, leaf_r) as f64;
-        let y1 = samp.sample(w1, leaf_r) as f64;
-        // tb0 = t0 + (t1 - z1) * l10, z1 into t1.
-        let (a_re, a_im) = (w0 - y0, w1 - y1);
-        let (b_re, b_im) = (a_re * l01_re - a_im * l01_im, a_re * l01_im + a_im * l01_re);
-        let (x0, x1) = (t0[0] + b_re, t0[1] + b_im);
-        t1[0] = y0;
-        t1[1] = y1;
-        t0[0] = samp.sample(x0, leaf_l) as f64;
-        t0[1] = samp.sample(x1, leaf_l) as f64;
-        return;
-    }
+/// Defines the ffSampling recursion under the name `$name`, with the given split, fused node
+/// pass and merge: once with the portable FFT functions ([`ffsampling`]) and, with the `simd`
+/// feature on x86-64, once compiled for x86-64-v3 with their copies (`ffsampling_v3`).
+macro_rules! ffsampling_fn {
+    (
+        $(#[$m:meta])*
+        $vis:vis fn $name:ident; split: $split:path, fused: $fused:path, merge: $merge:path
+    ) => {
+        $(#[$m])*
+        $vis fn $name<S: LeafSampler>(
+            samp: &mut S,
+            logn: u32,
+            t0: &mut [f64],
+            t1: &mut [f64],
+            tree: &[f64],
+            tmp: &mut [f64],
+        ) {
+            if logn == 1 {
+                // sampler.rs:527-557. t1's split is trivial: w0 = t1[0], w1 = t1[1].
+                let (l01_re, l01_im, leaf_r, leaf_l) = (tree[0], tree[1], tree[2], tree[3]);
+                let w0 = t1[0];
+                let w1 = t1[1];
+                let y0 = samp.sample(w0, leaf_r) as f64;
+                let y1 = samp.sample(w1, leaf_r) as f64;
+                // tb0 = t0 + (t1 - z1) * l10, z1 into t1.
+                let (a_re, a_im) = (w0 - y0, w1 - y1);
+                let (b_re, b_im) = (a_re * l01_re - a_im * l01_im, a_re * l01_im + a_im * l01_re);
+                let (x0, x1) = (t0[0] + b_re, t0[1] + b_im);
+                t1[0] = y0;
+                t1[1] = y1;
+                t0[0] = samp.sample(x0, leaf_l) as f64;
+                t0[1] = samp.sample(x1, leaf_l) as f64;
+                return;
+            }
 
-    if logn == 2 {
-        return ffsampling_logn2(samp, t0, t1, tree);
-    }
+            if logn == 2 {
+                return ffsampling_logn2(samp, t0, t1, tree);
+            }
 
-    let n = 1usize << logn;
-    let hn = n >> 1;
-    let sub = tree_size(logn - 1);
-    let (l10, rest) = tree.split_at(n);
-    let (right, left) = rest.split_at(sub);
-    let (w, rest) = tmp.split_at_mut(n);
+            let n = 1usize << logn;
+            let hn = n >> 1;
+            let sub = tree_size(logn - 1);
+            let (l10, rest) = tree.split_at(n);
+            let (right, left) = rest.split_at(sub);
+            let (w, rest) = tmp.split_at_mut(n);
 
-    // Split t1, sample the right sub-tree (sampler.rs:593-601).
-    {
-        let (w0, w1) = w.split_at_mut(hn);
-        poly_split_fft(logn, w0, w1, t1);
-        ffsampling(samp, logn - 1, w0, w1, right, rest);
-    }
+            // Split t1, sample the right sub-tree (sampler.rs:593-601).
+            {
+                let (w0, w1) = w.split_at_mut(hn);
+                $split(logn, w0, w1, t1);
+                $name(samp, logn - 1, w0, w1, right, rest);
+            }
 
-    // Merge z1 into t1, tb0 = t0 + (t1 - z1) * l10, split tb0 into (w0, w1)
-    // (sampler.rs:602-626), in one pass with the same operations.
-    merge_sub_mul_add_split(logn, w, t0, t1, l10);
+            // Merge z1 into t1, tb0 = t0 + (t1 - z1) * l10, split tb0 into (w0, w1)
+            // (sampler.rs:602-626), in one pass with the same operations.
+            $fused(logn, w, t0, t1, l10);
 
-    // Sample the left sub-tree, merge into t0 (sampler.rs:627-634).
-    {
-        let (w0, w1) = w.split_at_mut(hn);
-        ffsampling(samp, logn - 1, w0, w1, left, rest);
-        poly_merge_fft(logn, t0, w0, w1);
-    }
+            // Sample the left sub-tree, merge into t0 (sampler.rs:627-634).
+            {
+                let (w0, w1) = w.split_at_mut(hn);
+                $name(samp, logn - 1, w0, w1, left, rest);
+                $merge(logn, t0, w0, w1);
+            }
+        }
+    };
+}
+
+ffsampling_fn! {
+    /// Fast Fourier sampling over the tree (fn-dsa `ffsamp_fft_inner`, sampler.rs:505-635, with
+    /// tree lookups): on input the target `(t0, t1)` (FFT representation), on output the sampled
+    /// `(z0, z1)` (FFT representation). `tmp` needs `2n` values.
+    #[inline]
+    pub(crate) fn ffsampling;
+    split: poly_split_fft, fused: merge_sub_mul_add_split, merge: poly_merge_fft
+}
+
+ffsampling_fn! {
+    /// [`ffsampling`] compiled for x86-64-v3 (AVX2, BMI1, BMI2, LZCNT, POPCNT, no FMA), with the
+    /// copies of the FFT passes: the same operations, so the same results.
+    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+    #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
+    pub(crate) fn ffsampling_v3;
+    split: crate::fft::poly_split_fft_v3,
+    fused: crate::fft::merge_sub_mul_add_split_v3,
+    merge: crate::fft::poly_merge_fft_v3
 }
 
 /// The `logn = 1` node of [`ffsampling`] on scalars: `(t0, t1)` = `([t0_re, t0_im], [t1_re,

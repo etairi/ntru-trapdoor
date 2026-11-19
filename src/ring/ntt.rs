@@ -69,7 +69,7 @@ pub(crate) static P2: NttPrime =
     NttPrime::new(2147389441, 1862176767, 1141604340, 677655126, 2024968256);
 /// $`p_1^{-1}\bmod p_2`$ in Montgomery form modulo $`p_2`$: fn-dsa-kgen `PRIMES[1].s`
 /// (mp31.rs:347; $`1885487106\cdot2^{32}\bmod p_2`$ [computed]).
-const P1_INV_MOD_P2_MONT: u32 = 942807490;
+pub(crate) const P1_INV_MOD_P2_MONT: u32 = 942807490;
 
 impl NttPrime {
     const fn new(p: u32, p0i: u32, r2: u32, g: u32, ig: u32) -> NttPrime {
@@ -138,12 +138,18 @@ impl NttPrime {
             return;
         }
         // Layer lm has m = 2^lm blocks of t = n/m values, block i with the root gm[m + i]. With
-        // the `simd` feature, AVX2 or NEON runs the layers whose half-blocks have 8 values or
-        // more (4 with NEON).
+        // the `simd` feature, AVX-512 and AVX2 run the layers whose half-blocks have 8 values
+        // or more, NEON those with 4 or more.
         #[cfg(all(feature = "simd", any(target_arch = "x86_64", target_arch = "aarch64")))]
         let (mut t, mut m) = crate::simd::ntt_wide_layers(self, logn, a);
         #[cfg(not(all(feature = "simd", any(target_arch = "x86_64", target_arch = "aarch64"))))]
         let (mut t, mut m) = (n, 1usize);
+        // The layers below them, with the lanes regrouped in registers (from t = 8 with AVX2,
+        // t = 4 with NEON, for n >= 16).
+        #[cfg(all(feature = "simd", any(target_arch = "x86_64", target_arch = "aarch64")))]
+        if crate::simd::ntt_narrow_layers(self, logn, a, t) {
+            return;
+        }
         while t > 4 {
             let ht = t >> 1;
             for (blk, &s) in a.chunks_exact_mut(t).zip(self.gm[m..2 * m].iter()) {
@@ -196,31 +202,21 @@ impl NttPrime {
             a[1] = mp_mmul(mp_sub(u, v, p), self.igm[1], p, p0i);
             return;
         }
-        // Layer 0 pairs (2j, 2j + 1) with igm[n/2 + j]; layer 1 pairs (4i, 4i + 2) and
-        // (4i + 1, 4i + 3) with igm[n/4 + i].
-        let hn = n >> 1;
-        let (blocks, _) = a.as_chunks_mut::<4>();
-        let (g0, _) = self.igm[hn..n].as_chunks::<2>();
-        for ((b, &[s0, s1]), &s) in blocks.iter_mut().zip(g0).zip(self.igm[hn >> 1..hn].iter()) {
-            let (x0, x1) = (
-                mp_add(b[0], b[1], p),
-                mp_mmul(mp_sub(b[0], b[1], p), s0, p, p0i),
-            );
-            let (x2, x3) = (
-                mp_add(b[2], b[3], p),
-                mp_mmul(mp_sub(b[2], b[3], p), s1, p, p0i),
-            );
-            *b = [
-                mp_add(x0, x2, p),
-                mp_add(x1, x3, p),
-                mp_mmul(mp_sub(x0, x2, p), s, p, p0i),
-                mp_mmul(mp_sub(x1, x3, p), s, p, p0i),
-            ];
-        }
+        // With the `simd` feature, the first layers with the lanes regrouped in registers (up
+        // to t = 4 with AVX2, t = 2 with NEON, for n >= 16).
+        #[cfg(all(feature = "simd", any(target_arch = "x86_64", target_arch = "aarch64")))]
+        let narrow = crate::simd::intt_narrow_layers(self, logn, a);
+        #[cfg(not(all(feature = "simd", any(target_arch = "x86_64", target_arch = "aarch64"))))]
+        let narrow: Option<(usize, usize)> = None;
+        let (mut t, mut hm) = match narrow {
+            Some(next) => next,
+            None => {
+                self.intt_first_two_layers(logn, a);
+                (4usize, n >> 3)
+            }
+        };
         // Layer lm >= 2: hm = n / 2^(lm + 1) blocks of 2t values, block i with igm[hm + i]. With
-        // the `simd` feature, AVX2 runs the layers from t = 8 on (NEON from t = 4).
-        let mut t = 4usize;
-        let mut hm = n >> 3;
+        // the `simd` feature, AVX2 and AVX-512 run the layers from t = 8 on (NEON from t = 4).
         while t < n {
             #[cfg(all(feature = "simd", any(target_arch = "x86_64", target_arch = "aarch64")))]
             if crate::simd::intt_wide_layers(self, logn, a, t, hm) {
@@ -237,6 +233,33 @@ impl NttPrime {
             }
             t = dt;
             hm >>= 1;
+        }
+    }
+
+    /// The first two layers of [`NttPrime::intt_n`] ($`n\ge4`$), on blocks of 4 values: layer 0
+    /// pairs (2j, 2j + 1) with igm[n/2 + j], layer 1 pairs (4i, 4i + 2) and (4i + 1, 4i + 3)
+    /// with igm[n/4 + i].
+    fn intt_first_two_layers(&self, logn: u32, a: &mut [u32]) {
+        let (p, p0i) = (self.p, self.p0i);
+        let n = 1usize << logn;
+        let hn = n >> 1;
+        let (blocks, _) = a[..n].as_chunks_mut::<4>();
+        let (g0, _) = self.igm[hn..n].as_chunks::<2>();
+        for ((b, &[s0, s1]), &s) in blocks.iter_mut().zip(g0).zip(self.igm[hn >> 1..hn].iter()) {
+            let (x0, x1) = (
+                mp_add(b[0], b[1], p),
+                mp_mmul(mp_sub(b[0], b[1], p), s0, p, p0i),
+            );
+            let (x2, x3) = (
+                mp_add(b[2], b[3], p),
+                mp_mmul(mp_sub(b[2], b[3], p), s1, p, p0i),
+            );
+            *b = [
+                mp_add(x0, x2, p),
+                mp_add(x1, x3, p),
+                mp_mmul(mp_sub(x0, x2, p), s, p, p0i),
+                mp_mmul(mp_sub(x1, x3, p), s, p, p0i),
+            ];
         }
     }
 
@@ -385,6 +408,12 @@ impl ModQ {
         ((r & keep) | (r2 & !keep)) as u32
     }
 
+    /// The modulus $`q`$.
+    #[inline(always)]
+    pub(crate) fn q(&self) -> u32 {
+        self.q as u32
+    }
+
     /// The centred CRT lift of $`(u_1 \bmod p_1, u_2\bmod p_2)`$, reduced modulo $`q`$: the integer
     /// $`c\in(-P/2,P/2)`$ with $`c\equiv u_i`$, then $`c\bmod q`$.
     #[inline(always)]
@@ -402,6 +431,43 @@ impl ModQ {
         let keep = ((r2 as i64) >> 63) as u64;
         ((r & keep) | (r2 & !keep)) as u32
     }
+}
+
+/// `out[i] <- mq.crt(u1[i], u2[i])` for slices of equal length.
+pub(crate) fn crt_slice(mq: &ModQ, u1: &[u32], u2: &[u32], out: &mut [u32]) {
+    #[cfg(all(feature = "simd", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    if crate::simd::crt_slices(mq.q(), u1, u2, out, false) {
+        return;
+    }
+    for ((o, &x), &y) in out.iter_mut().zip(u1.iter()).zip(u2.iter()) {
+        *o = mq.crt(x, y);
+    }
+}
+
+/// `out[i] <- mq.reduce_i32(x[i])` for slices of equal length.
+pub(crate) fn reduce_i32_slice(mq: &ModQ, x: &[i32], out: &mut [u32]) {
+    #[cfg(all(feature = "simd", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    if crate::simd::reduce_i32_slices(mq.q(), x, out) {
+        return;
+    }
+    for (o, &v) in out.iter_mut().zip(x.iter()) {
+        *o = mq.reduce_i32(v);
+    }
+}
+
+/// `true` iff $`x_i+y_i\equiv z_i\pmod q`$ for every `i`, for signed `x` and canonical `y`, `z`
+/// of equal length. The comparison accumulates a mask over all values.
+pub(crate) fn add_i32_equals(mq: &ModQ, x: &[i32], y: &[u32], z: &[u32]) -> bool {
+    #[cfg(all(feature = "simd", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    if let Some(diff) = crate::simd::add_i32_diff(mq.q(), x, y, z) {
+        return diff == 0;
+    }
+    let q = mq.q();
+    let mut diff = 0u32;
+    for ((&a, &b), &c) in x.iter().zip(y.iter()).zip(z.iter()) {
+        diff |= mp_add(mq.reduce_i32(a), b, q) ^ c;
+    }
+    diff == 0
 }
 
 /// The residues of `a` (coefficients in $`[0,q)`$, $`q<p_1,p_2`$) modulo $`p_1`$ and $`p_2`$, in NTT
@@ -440,9 +506,7 @@ pub(crate) fn mul_prepared_mod_q(
     P2.pointwise_mul_prepared(&mut b2, &a2[..n]);
     P1.intt_n(logn, &mut b1);
     P2.intt_n(logn, &mut b2);
-    for ((o, &u1), &u2) in out[..n].iter_mut().zip(b1.iter()).zip(b2.iter()) {
-        *o = mq.crt(u1, u2);
-    }
+    crt_slice(&mq, &b1, &b2, &mut out[..n]);
     // `b` may be secret (f in key generation, the PCS's witnesses): wipe its residues (slice
     // wipes: `Vec::zeroize` would also wipe the capacity byte by byte, about ten times the cost
     // [measured, sign/README.md]).
@@ -514,6 +578,10 @@ pub(crate) fn sum_of_prepared_products_mod_q(
         }
         P1.intt_n(logn, &mut acc1);
         P2.intt_n(logn, &mut acc2);
+        #[cfg(all(feature = "simd", any(target_arch = "x86_64", target_arch = "aarch64")))]
+        if crate::simd::crt_slices(q, &acc1, &acc2, out, true) {
+            continue;
+        }
         for ((o, &u1), &u2) in out.iter_mut().zip(acc1.iter()).zip(acc2.iter()) {
             *o = mp_add(*o, mq.crt(u1, u2), q);
         }
@@ -558,7 +626,16 @@ pub(crate) fn prepare_centred_p1(logn: u32, q: u32, a: &[u32]) -> Vec<u32> {
 /// is $`a`$ since $`q<p_1`$. One inverse and one forward NTT.
 pub(crate) fn centred_p1_from_prepared(logn: u32, q: u32, r1: &[u32]) -> Vec<u32> {
     let n = 1usize << logn;
-    let mut a: Vec<u32> = r1[..n].iter().map(|&x| P1.mmul(x, 1)).collect();
+    let mut a = r1[..n].to_vec();
+    #[cfg(all(feature = "simd", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let done = crate::simd::mmul_slices_const(&P1, &mut a, None, 1);
+    #[cfg(not(all(feature = "simd", any(target_arch = "x86_64", target_arch = "aarch64"))))]
+    let done = false;
+    if !done {
+        for x in a.iter_mut() {
+            *x = P1.mmul(*x, 1);
+        }
+    }
     P1.intt_n(logn, &mut a);
     let r = prepare_centred_p1(logn, q, &a);
     a.as_mut_slice().zeroize();
@@ -595,12 +672,18 @@ pub(crate) fn mul_ternary_p1_mod_q(logn: u32, q: u32, ac1: &[u32], t: &[u32], ou
     P1.ntt(logn, &mut b);
     P1.pointwise_mul_prepared(&mut b, &ac1[..n]);
     P1.intt_n(logn, &mut b);
-    let half = p >> 1;
-    for (o, &u) in out[..n].iter_mut().zip(b.iter()) {
-        // The integer is u if u <= (p1 - 1)/2, else u - p1; |c| < 2^31.
-        let neg = ((half.wrapping_sub(u) as i32) >> 31) as u32;
-        let c = (u as i64 - (p & neg) as i64) as i32;
-        *o = mq.reduce_i32(c);
+    #[cfg(all(feature = "simd", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let done = crate::simd::centred_p1_mod_q(q, &b, &mut out[..n]);
+    #[cfg(not(all(feature = "simd", any(target_arch = "x86_64", target_arch = "aarch64"))))]
+    let done = false;
+    if !done {
+        let half = p >> 1;
+        for (o, &u) in out[..n].iter_mut().zip(b.iter()) {
+            // The integer is u if u <= (p1 - 1)/2, else u - p1, and |c| < 2^31.
+            let neg = ((half.wrapping_sub(u) as i32) >> 31) as u32;
+            let c = (u as i64 - (p & neg) as i64) as i32;
+            *o = mq.reduce_i32(c);
+        }
     }
     b.as_mut_slice().zeroize();
 }
@@ -644,6 +727,11 @@ pub(crate) fn ntru_equation_holds(
         let (rf, rest) = buf.split_at(n);
         let (rg, rest) = rest.split_at(n);
         let (rbf, rbg) = rest.split_at(n);
+        #[cfg(all(feature = "simd", any(target_arch = "x86_64", target_arch = "aarch64")))]
+        if let Some(d) = crate::simd::ntru_diff(pr, q, rf, rg, rbf, rbg) {
+            diff |= d;
+            continue;
+        }
         for i in 0..n {
             let lhs = mp_sub(pr.mul(rf[i], rbg[i]), pr.mul(rg[i], rbf[i]), p);
             diff |= lhs ^ q;
