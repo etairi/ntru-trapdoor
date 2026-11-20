@@ -17,12 +17,15 @@
 //!   the sign $`b=w\bmod2`$ and the top 63 bits $`H=\lfloor w/2\rfloor`$ of $`V`$. A branch-free
 //!   scan of fixed length compares $`H`$ with the top 63 bits $`H_j=\lfloor T_j/2^{129}\rfloor`$
 //!   of the 28 entries where they are nonzero (the other 13 entries have $`H_j=0`$: they can
-//!   only tie, when $`H=0`$, and never count). If $`H`$ equals no $`H_j`$, $`z_0`$ is decided
-//!   ($`V<T_j\iff H<H_j`$). Otherwise (probability at most $`29\cdot2^{-63}=2^{-58.1}`$ per
-//!   draw) the low 129 bits of $`V`$ are drawn (two `next_u64`, then the low bit of `next_u8`)
-//!   and the full 192-bit comparison decides. The distribution is exactly that of the 192-bit
-//!   table; a draw takes 8 PRNG bytes (25 in the rare fallback). The fallback's branch leaks
-//!   only that rare event.
+//!   only tie, when $`H=0`$, and never count). The scan counts the entries above $`H`$, and a
+//!   second sum over every entry tells whether $`H`$ equals one of them (`scan_top`). If it
+//!   equals none and $`H\ne0`$, $`z_0`$ is decided ($`V<T_j\iff H<H_j`$). Otherwise
+//!   (probability at most $`29\cdot2^{-63}=2^{-58.1}`$ per draw) the low 129 bits of $`V`$ are
+//!   drawn (two `next_u64`, then the low bit of `next_u8`) and the full 192-bit comparison
+//!   decides. The distribution is exactly that of the 192-bit table. A draw takes 8 PRNG bytes
+//!   (25 in the rare fallback). The fallback's branch leaks only that rare event. The tie is not
+//!   tested by comparing $`H`$ with each $`H_j`$ for equality: compilers turn that test into a
+//!   tree of branches on $`H`$ (`tools/sampler_branches.py` checks the compiled code).
 //! - `Falcon1_8205`: fn-dsa's `gaussian0` (one `next_u64`, one `next_u16`, and the 31+24+24-bit
 //!   limb comparison with every row of [`crate::tables::GAUSS0_1_8205_79`], which equals fn-dsa's
 //!   `GAUSS0`). The rows are read through a copy of the table by columns, padded with zero rows
@@ -111,13 +114,14 @@ impl<'a, P: Prng> SamplerZ<'a, P> {
         self.trials
     }
 
-    /// fn-dsa `Sampler::next` (sampler.rs:131-192), with the base `B`.
+    /// fn-dsa `Sampler::next` (sampler.rs:131-192), with the base `B`. `ROUND` says that the code
+    /// is compiled for a processor that rounds to an integer in one instruction (aarch64, and the
+    /// x86-64-v3 copy): then the integer parts below are taken by rounding (`floor`, `trunc`)
+    /// rather than through a conversion to an integer and back, with the same values.
     #[inline(always)]
-    fn next<B: BaseGauss>(&mut self, mu: f64, isigma: f64) -> i32 {
+    fn next<B: BaseGauss, const ROUND: bool>(&mut self, mu: f64, isigma: f64) -> i32 {
         // Centre mu = s + r, s integer, 0 <= r < 1 (FLR::floor, flr_native.rs:437-480).
-        let s = mu.floor() as i64;
-        let r = mu - s as f64;
-        let s = s as i32;
+        let (s, r) = centre::<ROUND>(mu);
 
         // dss = 1/(2 sigma^2) = 0.5 * isigma^2.
         let dss = (isigma * isigma) * 0.5;
@@ -132,7 +136,7 @@ impl<'a, P: Prng> SamplerZ<'a, P> {
         loop {
             // Bimodal proposal: z0 from the half-Gaussian of width sigma0, b a random bit;
             // z = z0 + 1 if b = 1, z = -z0 if b = 0.
-            let (z0, b) = B::draw(self.prng);
+            let (z0, b) = B::draw::<P, ROUND>(self.prng);
             self.trials += 1;
             let z = b + ((b << 1) - 1) * z0;
 
@@ -142,7 +146,7 @@ impl<'a, P: Prng> SamplerZ<'a, P> {
             let mut x = (t * t) * dss;
             x -= ((z0 * z0) as f64) * B::INV_2SQRSIGMA0;
             let accept = if shortcut {
-                ber_exp_shortcut(self.prng, x, ccs)
+                ber_exp_shortcut::<P, ROUND>(self.prng, x, ccs)
             } else {
                 ber_exp(self.prng, x, ccs)
             };
@@ -153,14 +157,46 @@ impl<'a, P: Prng> SamplerZ<'a, P> {
     }
 }
 
+/// Whether the portable code rounds to an integer in one instruction (`frintm`, `frintz` on
+/// aarch64). On x86-64 without SSE4.1 `floor` and `trunc` are library calls, and the conversions
+/// to an integer and back are faster.
+const NATIVE_ROUND: bool = cfg!(target_arch = "aarch64");
+
 impl<P: Prng> LeafSampler for SamplerZ<'_, P> {
     #[inline]
     fn sample(&mut self, mu: f64, isigma: f64) -> i32 {
         match self.params.base {
-            BaseSampler::HalfGauss3_1 => self.next::<HalfGauss31>(mu, isigma),
-            BaseSampler::Falcon1_8205 => self.next::<Falcon18205>(mu, isigma),
+            BaseSampler::HalfGauss3_1 => self.next::<HalfGauss31, NATIVE_ROUND>(mu, isigma),
+            BaseSampler::Falcon1_8205 => self.next::<Falcon18205, NATIVE_ROUND>(mu, isigma),
         }
     }
+}
+
+/// A centre $`\mu=s+r`$ with $`s=\lfloor\mu\rfloor`$ (as `i32`, wrapping like fn-dsa's cast)
+/// and $`r=\mu-s`$. fn-dsa computes `r = mu - (floor(mu) as i64) as f64`. With `ROUND`, `r` is
+/// `mu - floor(mu)` instead, one conversion shorter: the same value whenever
+/// `|floor(mu)| < 2^62` (the integer is then exact both ways), except for `mu = -0.0`, where it
+/// is `+0.0` against fn-dsa's `-0.0`, which no difference `z - r` of the sampler distinguishes
+/// (test `centre_forms_agree`). Larger centres take fn-dsa's form.
+#[inline(always)]
+fn centre<const ROUND: bool>(mu: f64) -> (i32, f64) {
+    let fl = mu.floor();
+    if ROUND {
+        if fl.abs() >= 4_611_686_018_427_387_904.0 {
+            return centre_far(mu);
+        }
+        return (fl as i64 as i32, mu - fl);
+    }
+    let s = fl as i64;
+    (s as i32, mu - s as f64)
+}
+
+/// [`centre`] for `|floor(mu)| >= 2^62` (or NaN): fn-dsa's form.
+#[cold]
+#[inline(never)]
+fn centre_far(mu: f64) -> (i32, f64) {
+    let s = mu.floor() as i64;
+    (s as i32, mu - s as f64)
 }
 
 #[cfg(all(feature = "simd", target_arch = "x86_64"))]
@@ -172,8 +208,8 @@ impl<P: Prng> SamplerZ<'_, P> {
     #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt,popcnt")]
     pub(crate) fn sample_v3(&mut self, mu: f64, isigma: f64) -> i32 {
         match self.params.base {
-            BaseSampler::HalfGauss3_1 => self.next::<HalfGauss31>(mu, isigma),
-            BaseSampler::Falcon1_8205 => self.next::<Falcon18205>(mu, isigma),
+            BaseSampler::HalfGauss3_1 => self.next::<HalfGauss31, true>(mu, isigma),
+            BaseSampler::Falcon1_8205 => self.next::<Falcon18205, true>(mu, isigma),
         }
     }
 }
@@ -195,8 +231,8 @@ impl<F: FnMut(f64, f64) -> i32> LeafSampler for FnSampler<F> {
 trait BaseGauss {
     /// $`1/(2\sigma_0^2)`$.
     const INV_2SQRSIGMA0: f64;
-    /// Draws $`(z_0, b)`$.
-    fn draw<P: Prng>(prng: &mut P) -> (i32, i32);
+    /// Draws $`(z_0, b)`$, in code for 64-bit vector comparisons if `WIDE` ([`scan_top`]).
+    fn draw<P: Prng, const WIDE: bool>(prng: &mut P) -> (i32, i32);
 }
 
 /// Width 3.1, the 192-bit table [`tables::BASE_3_1_192`], drawn lazily (module documentation).
@@ -239,6 +275,47 @@ const fn top63_prefix<const N: usize>(t: &[[u64; 3]]) -> [u64; N] {
     out
 }
 
+/// The fixed-length scan on the top bits $`H`$ of a draw: $`z_0=\#\{j:H<H_j\}`$ (the entries
+/// with $`H_j=0`$ never count), and whether $`H`$ ties with some $`H_j`$ (with an entry
+/// $`H_j=0`$ when $`H=0`$). The tie comes from the same sums over every entry, with no branch
+/// and no index that depends on $`H`$, in one of two forms of equal value, whichever compiles to
+/// the faster code. With `WIDE` (code with 64-bit vector comparisons: aarch64, x86-64-v3), one
+/// sum $`d=\#\{j:H<H_j\}-\#\{j:H>H_j\}`$: the nonzero $`H_j`$ are distinct, so at most one
+/// equals $`H`$, and $`d+28=2z_0+t`$ with $`t\in\{0,1\}`$ the number of entries equal to $`H`$.
+/// Without it, two counts, $`z_0`$ and $`\#\{j:H\le H_j\}`$, which exceeds $`z_0`$ by $`t`$. The
+/// direct form, an OR of the equalities $`H=H_j`$, is the same value too, but compilers turn that
+/// OR into a tree of branches on $`H`$, that is, on the secret draw (test
+/// `tie_counts_equal_scan`, and `tools/sampler_branches.py` on the compiled code).
+#[inline(always)]
+fn scan_top<const WIDE: bool>(h: u64) -> (i32, bool) {
+    let zero_tie = (h == 0) & BASE_HAS_ZERO_TOP;
+    if WIDE {
+        let mut d = 0i32;
+        for &t in BASE_HI63.iter() {
+            d += (h < t) as i32 - (h > t) as i32;
+        }
+        let s = d + BASE_NZ as i32;
+        (s >> 1, ((s & 1) != 0) | zero_tie)
+    } else {
+        let mut lt = 0i32;
+        let mut le = 0i32;
+        for &t in BASE_HI63.iter() {
+            lt += (h < t) as i32;
+            le += (h <= t) as i32;
+        }
+        (lt, (le != lt) | zero_tie)
+    }
+}
+
+/// The nonzero $`H_j`$ decrease strictly, as the one-sum form of [`scan_top`] needs.
+const _: () = {
+    let mut j = 1;
+    while j < BASE_NZ {
+        assert!(BASE_HI63[j] < BASE_HI63[j - 1]);
+        j += 1;
+    }
+};
+
 /// `a < b` for 192-bit values given as `[high, middle, low]` limbs.
 #[inline(always)]
 fn lt192(a: [u64; 3], b: [u64; 3]) -> bool {
@@ -251,19 +328,12 @@ impl BaseGauss for HalfGauss31 {
     const INV_2SQRSIGMA0: f64 = BaseSampler::HalfGauss3_1.inv_2sqr_sigma0();
 
     #[inline(always)]
-    fn draw<P: Prng>(prng: &mut P) -> (i32, i32) {
+    fn draw<P: Prng, const WIDE: bool>(prng: &mut P) -> (i32, i32) {
         // V = H * 2^129 + L, H = the top 63 bits (from one u64, whose low bit is the sign).
         let w = prng.next_u64();
         let b = (w & 1) as i32;
         let h = w >> 1;
-        // Fixed-length scan on the top bits: z0 = #{j : H < H_j} (the entries with H_j = 0 never
-        // count), and whether H ties with some H_j (with H_j = 0 when H = 0).
-        let mut z = 0i32;
-        let mut eq = (h == 0) & BASE_HAS_ZERO_TOP;
-        for &t in BASE_HI63.iter() {
-            z += (h < t) as i32;
-            eq |= h == t;
-        }
+        let (mut z, eq) = scan_top::<WIDE>(h);
         if eq {
             // Probability <= 29 * 2^-63: the low 129 bits decide (full 192-bit comparison).
             // L = m * 2^65 + l * 2 + last.
@@ -306,7 +376,7 @@ impl BaseGauss for Falcon18205 {
 
     /// fn-dsa `gaussian0` (sampler.rs:241-260).
     #[inline(always)]
-    fn draw<P: Prng>(prng: &mut P) -> (i32, i32) {
+    fn draw<P: Prng, const WIDE: bool>(prng: &mut P) -> (i32, i32) {
         let lo = prng.next_u64();
         let hi = prng.next_u16();
         Self::limbs(lo, hi)
@@ -385,12 +455,22 @@ const E0: f64 = 0.707_106_781_186_547_5 * 256.0;
 /// first byte is `m` or `m + 1`, `m = clamp(floor(f - 1/32), 0, 254)`: in 2 of 256 trials,
 /// whatever the inputs. Other `x` (negative, NaN) take [`ber_exp`].
 #[inline(always)]
-fn ber_exp_shortcut<P: Prng>(prng: &mut P, x: f64, ccs: f64) -> bool {
+fn ber_exp_shortcut<P: Prng, const ROUND: bool>(prng: &mut P, x: f64, ccs: f64) -> bool {
     if x.is_nan() || x < 0.0 {
         return ber_exp(prng, x, ccs);
     }
-    let s = (x * INV_LOG2) as i64;
-    let r = x - (s as f64) * LOG2;
+    // s = trunc(x / ln 2), r = x - s ln 2. With ROUND the float s is the rounding itself, not
+    // the integer converted back: the same value for s < 2^63, and for larger s (x >= 2^63 ln 2)
+    // f below is 0 either way.
+    let xs = x * INV_LOG2;
+    let (s, sf) = if ROUND {
+        let sf = xs.trunc();
+        (sf as i64, sf)
+    } else {
+        let s = xs as i64;
+        (s, s as f64)
+    };
+    let r = x - sf * LOG2;
     // f ~ ccs e^-r 2^(8 - s) = z / 2^56, within 6.2e-4 for 0 <= s <= 7. For s >= 8 the
     // threshold's top byte is 0 (s >= 64: the threshold is 0), and f = 0 gives m = 0.
     let f = if s < 8 {
@@ -402,7 +482,7 @@ fn ber_exp_shortcut<P: Prng>(prng: &mut P, x: f64, ccs: f64) -> bool {
         0.0
     };
     let w0 = prng.next_u8();
-    let (accept, reject) = first_byte_decision(f - DELTA, w0);
+    let (accept, reject) = first_byte_decision(f, w0);
     if accept {
         return true;
     }
@@ -413,17 +493,22 @@ fn ber_exp_shortcut<P: Prng>(prng: &mut P, x: f64, ccs: f64) -> bool {
 }
 
 /// The decision of the first Bernoulli byte `w` against the window
-/// $`m=\min(254,\max(0,\lfloor f_l\rfloor))`$, $`f_l=f-1/32\ge-1/32`$: accept when $`w<m`$,
-/// reject when $`w>m+1`$, and neither (the exact comparison) otherwise. Computed on
-/// $`g=\max(f_l,0)`$ without forming $`m`$: for integers $`w`$, $`w<\lfloor g\rfloor`$ is
-/// $`w+1\le g`$, and $`w>\min(254,\lfloor g\rfloor)+1`$ is $`g<w-1`$ (both sides false when
-/// $`\lfloor g\rfloor\ge254`$, since $`w\le255`$), so the float-to-integer conversion leaves
-/// the chain of dependent operations (test `first_byte_decision_equals_window`).
+/// $`m=\min(254,\max(0,\lfloor f-1/32\rfloor))`$ of the estimate $`0\le f<260`$: accept when
+/// $`w<m`$, reject when $`w>m+1`$, and neither (the exact comparison) otherwise. Computed
+/// without forming $`m`$, so that neither a conversion to an integer nor the subtraction of
+/// $`1/32`$ sits in the chain of dependent operations: $`f-1/32`$ is exact for $`f\ge1/32`$
+/// (both are multiples of the ulp of $`f`$), so for integers $`w`$, $`w<\lfloor f-1/32\rfloor`$
+/// is $`f\ge w+1+1/32`$, and $`w>\min(254,\max(0,\lfloor f-1/32\rfloor))+1`$ is
+/// $`w\ge2`$ and $`f<w-1+1/32`$ (both sides false when $`\lfloor f-1/32\rfloor\ge254`$, since
+/// $`w\le255`$). The thresholds are exact sums of small integers and $`1/32`$ (test
+/// `first_byte_decision_equals_window`).
 #[inline(always)]
-fn first_byte_decision(fl: f64, w: u8) -> (bool, bool) {
-    let g = fl.max(0.0);
+fn first_byte_decision(f: f64, w: u8) -> (bool, bool) {
     let wf = w as f64;
-    ((w < 254) & (wf + 1.0 <= g), g < wf - 1.0)
+    (
+        (w < 254) & (f >= (wf + 1.0) + DELTA),
+        (w >= 2) & (f < (wf - 1.0) + DELTA),
+    )
 }
 
 /// [`ber_exp`] from an already read first byte `w0`: the exact threshold, then the lazy
@@ -572,11 +657,11 @@ mod tests {
     #[test]
     fn base_draw_consumption() {
         let mut p = Bytes((0..=255u8).cycle().take(4096).collect(), 0);
-        let _ = HalfGauss31::draw(&mut p);
+        let _ = HalfGauss31::draw::<_, false>(&mut p);
         assert_eq!(p.1, 8);
         assert_eq!(p.1, BaseSampler::HalfGauss3_1.bytes_per_draw());
         let mut p = Bytes((0..=255u8).cycle().take(4096).collect(), 0);
-        let _ = Falcon18205::draw(&mut p);
+        let _ = Falcon18205::draw::<_, false>(&mut p);
         assert_eq!(p.1, BaseSampler::Falcon1_8205.bytes_per_draw());
     }
 
@@ -637,6 +722,36 @@ mod tests {
         }
     }
 
+    /// `scan_top` (two counts) gives the count and the tie of the direct scan (an OR of
+    /// equalities), for top bits at, next to and between all entries, at both ends of their
+    /// range, and at random values of every magnitude.
+    #[test]
+    fn tie_counts_equal_scan() {
+        let mut hs: Vec<u64> = vec![0, 1, 2, (1 << 63) - 1, (1 << 63) - 2, 1 << 62];
+        for &t in BASE_HI63.iter() {
+            hs.extend([t, t - 1, t + 1, t / 2, (t + t / 3).min((1 << 63) - 1)]);
+        }
+        for w in BASE_HI63.windows(2) {
+            hs.push(w[1] + (w[0] - w[1]) / 2);
+        }
+        let mut rng = Shake256Prng::new(b"tie-lookup");
+        for _ in 0..100_000 {
+            let e = rng.next_u8() % 63;
+            hs.push((rng.next_u64() >> 1) >> e);
+        }
+        for &h in &hs {
+            assert!(h < 1 << 63);
+            let mut z = 0i32;
+            let mut eq = (h == 0) & BASE_HAS_ZERO_TOP;
+            for &t in BASE_HI63.iter() {
+                z += (h < t) as i32;
+                eq |= h == t;
+            }
+            assert_eq!(scan_top::<true>(h), (z, eq), "h {h:#x}");
+            assert_eq!(scan_top::<false>(h), (z, eq), "h {h:#x}");
+        }
+    }
+
     /// The 192-bit value as `[high, middle, low]` limbs.
     fn limbs(v_hi: u64, l: u128) -> [u64; 3] {
         // V = v_hi * 2^128 + l, l < 2^128.
@@ -663,23 +778,40 @@ mod tests {
         [(h << 1) | (m >> 63), (m << 1) | (l >> 63), (l << 1) | last]
     }
 
+    /// The width-3.1 draw, with both forms of the scan.
+    fn draw31(p: &mut Bytes, wide: bool) -> (i32, i32) {
+        if wide {
+            HalfGauss31::draw::<_, true>(p)
+        } else {
+            HalfGauss31::draw::<_, false>(p)
+        }
+    }
+
     /// The width-3.1 draw at the extremes: V = 0 gives the largest z0 (41) through the
     /// fallback (H = 0 ties with the entries whose top bits are 0); V = max gives 0 directly.
     #[test]
     fn half_gauss_extremes() {
-        let mut p = Bytes(draw_bytes(0, 1, 0, 0, 0), 0);
-        assert_eq!(HalfGauss31::draw(&mut p), (41, 1));
-        assert_eq!(p.1, 25);
-        let mut p = Bytes(draw_bytes(u64::MAX >> 1, 0, 0, 0, 0), 0);
-        assert_eq!(HalfGauss31::draw(&mut p), (0, 0));
-        assert_eq!(p.1, 8);
+        for wide in [false, true] {
+            let mut p = Bytes(draw_bytes(0, 1, 0, 0, 0), 0);
+            assert_eq!(draw31(&mut p, wide), (41, 1));
+            assert_eq!(p.1, 25);
+            let mut p = Bytes(draw_bytes(u64::MAX >> 1, 0, 0, 0, 0), 0);
+            assert_eq!(draw31(&mut p, wide), (0, 0));
+            assert_eq!(p.1, 8);
+        }
     }
 
     /// The lazy draw equals the full 192-bit comparison, in particular on the fallback path: H
     /// equal to the top bits of every entry, with low bits just below, at and above the entry's;
-    /// and H = 0 against the small entries.
+    /// and H = 0 against the small entries. Both forms of the scan.
     #[test]
     fn half_gauss_lazy_equals_full() {
+        for wide in [false, true] {
+            lazy_equals_full(wide);
+        }
+    }
+
+    fn lazy_equals_full(wide: bool) {
         let mut rng = Shake256Prng::new(b"lazy");
         for &t in BASE.iter() {
             let h = t[0] >> 1;
@@ -717,7 +849,7 @@ mod tests {
                 let v = v_of(h, m, l, last as u64);
                 assert_eq!(v, limbs((h << 1) | bit, l128));
                 let mut p = Bytes(draw_bytes(h, 1, m, l, last), 0);
-                assert_eq!(HalfGauss31::draw(&mut p), (z_full(v), 1));
+                assert_eq!(draw31(&mut p, wide), (z_full(v), 1));
                 assert_eq!(p.1, 25);
             }
         }
@@ -725,7 +857,7 @@ mod tests {
             let w = rng.next_u64();
             let (m, l, last) = (rng.next_u64(), rng.next_u64(), rng.next_u8() & 1);
             let mut p = Bytes(draw_bytes(w >> 1, w & 1, m, l, last), 0);
-            let (z, b) = HalfGauss31::draw(&mut p);
+            let (z, b) = draw31(&mut p, wide);
             let v = v_of(w >> 1, m, l, last as u64);
             assert_eq!((z, b), (z_full(v), (w & 1) as i32));
         }
@@ -808,7 +940,7 @@ mod tests {
         let mut ones = 0u64;
         let mut prng = Shake256Prng::new(b"base 3.1");
         for _ in 0..draws {
-            let (z, b) = HalfGauss31::draw(&mut prng);
+            let (z, b) = HalfGauss31::draw::<_, NATIVE_ROUND>(&mut prng);
             hist[z as usize] += 1;
             ones += b as u64;
         }
@@ -826,7 +958,7 @@ mod tests {
         let mut ones = 0u64;
         let mut prng = Shake256Prng::new(b"base 1.8205");
         for _ in 0..draws {
-            let (z, b) = Falcon18205::draw(&mut prng);
+            let (z, b) = Falcon18205::draw::<_, NATIVE_ROUND>(&mut prng);
             hist[z as usize] += 1;
             ones += b as u64;
         }
@@ -868,29 +1000,81 @@ mod tests {
     }
 
     /// The decision of `first_byte_decision` is the window's: `w < m` accepts and `w > m + 1`
-    /// rejects, for `m = clamp(floor(f_l), 0, 254)` (the integer form that it replaces), for
-    /// every byte and for `f_l` at, just below and just above every integer from -1 to 257, at
-    /// -1/32, and at random values in [-1/32, 260).
+    /// rejects, for `m = clamp(floor(f - 1/32), 0, 254)` computed as fn-dsa-style integer code
+    /// would (the form that it replaces), for every byte and for `f` at, just below and just
+    /// above every integer and every integer plus 1/32 from 0 to 258, at 0, 1/32 and the
+    /// smallest positive value, and at random values in [0, 260).
     #[test]
     fn first_byte_decision_equals_window() {
-        let mut fls: Vec<f64> = vec![-1.0 / 32.0, -0.0, 0.0, 5e-324];
-        for k in -1..=257i32 {
-            let v = k as f64;
-            fls.extend([v, v.next_down(), v.next_up(), v - 1e-9, v + 1e-9, v + 0.5]);
+        let mut fs: Vec<f64> = vec![0.0, -0.0, 5e-324, DELTA, DELTA.next_down(), DELTA.next_up()];
+        for k in 0..=258i32 {
+            for v in [k as f64, k as f64 + DELTA, k as f64 - DELTA] {
+                fs.extend([v, v.next_down(), v.next_up(), v - 1e-9, v + 1e-9, v + 0.5]);
+            }
         }
         let mut rng = Shake256Prng::new(b"first-byte-decision");
         for _ in 0..20_000 {
             let u = (rng.next_u64() >> 11) as f64 / (1u64 << 53) as f64;
-            fls.push(u * 260.03125 - 1.0 / 32.0);
+            fs.push(u * 260.0);
         }
-        for &fl in &fls {
-            if fl < -1.0 / 32.0 {
+        for &f in &fs {
+            if f.is_nan() || f < 0.0 {
                 continue;
             }
+            let fl = f - DELTA;
             let m = if fl < 0.0 { 0 } else { (fl as u32).min(254) };
             for w in 0..=255u8 {
                 let want = ((w as u32) < m, (w as u32) > m + 1);
-                assert_eq!(first_byte_decision(fl, w), want, "fl {fl:e} w {w}");
+                assert_eq!(first_byte_decision(f, w), want, "f {f:e} w {w}");
+            }
+        }
+    }
+
+    /// `centre::<true>` (one rounding) and `centre::<false>` (fn-dsa's conversion and back) give
+    /// the same integer and offset, and the same differences `z - r` for the proposals `z` of the
+    /// sampler: around every integer, at the 2^62 switch, at the edges of `i64` and beyond, and
+    /// on random centres of every magnitude. The offsets differ only in the sign of a zero (for
+    /// `mu = -0.0`), which `z - r` does not see.
+    #[test]
+    fn centre_forms_agree() {
+        let mut mus: Vec<f64> = vec![
+            0.0,
+            -0.0,
+            0.5,
+            -0.5,
+            1e-300,
+            -1e-300,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
+            1e300,
+            -1e300,
+        ];
+        for k in [1.0f64, 2.0, 1e3, 4_611_686_018_427_387_904.0, 9.3e18, 1e19] {
+            for v in [k, -k] {
+                mus.extend([v, v.next_down(), v.next_up(), v + 0.5, v - 0.5]);
+            }
+        }
+        let mut rng = Shake256Prng::new(b"centre-forms");
+        for _ in 0..100_000 {
+            let e = (rng.next_u8() % 70) as i32 - 10;
+            let u = (rng.next_u64() >> 11) as f64 / (1u64 << 53) as f64 - 0.5;
+            mus.push(u * 2f64.powi(e));
+        }
+        for &mu in &mus {
+            let (sa, ra) = centre::<true>(mu);
+            let (sb, rb) = centre::<false>(mu);
+            assert_eq!(sa, sb, "mu {mu:e}");
+            assert!(
+                ra == rb || (ra.is_nan() && rb.is_nan()),
+                "mu {mu:e}: {ra} {rb}"
+            );
+            if ra.to_bits() != rb.to_bits() && !ra.is_nan() {
+                assert_eq!((ra, mu.to_bits()), (0.0, (-0.0f64).to_bits()), "mu {mu:e}");
+            }
+            for z in -45..=45i32 {
+                let (ta, tb) = (z as f64 - ra, z as f64 - rb);
+                assert!(ta.to_bits() == tb.to_bits() || (ta.is_nan() && tb.is_nan()));
             }
         }
     }
@@ -962,12 +1146,15 @@ mod tests {
                             });
                         }
                         bytes.extend((0..8).map(|_| rng.next_u8()));
-                        let (mut a, mut b) = (Bytes(bytes.clone(), 0), Bytes(bytes, 0));
+                        let mut a = Bytes(bytes.clone(), 0);
+                        let mut b = Bytes(bytes.clone(), 0);
+                        let mut c = Bytes(bytes, 0);
                         let ra = ber_exp(&mut a, x, ccs);
-                        let rb = ber_exp_shortcut(&mut b, x, ccs);
+                        let rb = ber_exp_shortcut::<_, false>(&mut b, x, ccs);
+                        let rc = ber_exp_shortcut::<_, true>(&mut c, x, ccs);
                         assert_eq!(
-                            (ra, a.1),
-                            (rb, b.1),
+                            ((ra, a.1), (ra, a.1)),
+                            ((rb, b.1), (rc, c.1)),
                             "x {x:e} ({:#x}) ccs {ccs} w0 {w0}",
                             x.to_bits()
                         );
@@ -1009,11 +1196,11 @@ mod tests {
                 loop {
                     let (z0, b, inv) = match e.1.base {
                         BaseSampler::HalfGauss3_1 => {
-                            let (z0, b) = HalfGauss31::draw(e.0);
+                            let (z0, b) = HalfGauss31::draw::<_, false>(e.0);
                             (z0, b, HalfGauss31::INV_2SQRSIGMA0)
                         }
                         BaseSampler::Falcon1_8205 => {
-                            let (z0, b) = Falcon18205::draw(e.0);
+                            let (z0, b) = Falcon18205::draw::<_, false>(e.0);
                             (z0, b, Falcon18205::INV_2SQRSIGMA0)
                         }
                     };

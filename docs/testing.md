@@ -12,11 +12,11 @@ cargo bench                                        # criterion: benches/{sign,ke
 python3 tools/gauss_tables.py --check              # src/tables.rs against its definition (mpmath)
 ```
 
-`cargo test` runs 143 tests: 83 unit tests, 59 integration tests in 15 files, and 1 doctest.
+`cargo test` runs 146 tests: 86 unit tests, 59 integration tests in 15 files, and 1 doctest.
 Twelve more are ignored by default because they are long. `cargo test --release --
---include-ignored` runs all 155 in about 81 s on an Apple M4. The `simd` feature adds the
-tests that compare its kernels with the portable code, ten on aarch64 and twelve on x86-64,
-and an ignored timing table of the Keccak kernels.
+--include-ignored` runs all 158 in about 81 s on an Apple M4. The `simd` feature adds the
+tests that compare its kernels with the portable code, eleven on aarch64 and thirteen on
+x86-64, and an ignored timing table of the Keccak kernels.
 
 ## What the tests cover
 
@@ -44,6 +44,11 @@ and an ignored timing table of the Keccak kernels.
     bound, and the encodings, each re-checked by an independent computation;
   - the refusal of inconsistent trapdoors and invalid rings, the leaf windows, and the refusal of
     a Gram–Schmidt bound above `(1.17 √q)²` (security.md, "Key distribution").
+- **Compiled code** (`tools/sampler_branches.py`, in CI on x86-64 and aarch64 with both
+  toolchains): the optimized LLVM IR of the library, default build and `simd`, has no `switch`
+  over the width-3.1 base table's entries and no conditional branch on a comparison with them.
+  The script fails on the code of 0.1.2, whose tie test compiled to such a tree. Unit tests
+  compare both forms of the scan with the direct one, on every entry, next to and between them.
 
 The statistical tools in [`examples/`](../examples) and the analysis scripts in
 [`tools/stats/`](../tools/stats) reproduce the figures of [precision.md](precision.md), and
@@ -59,8 +64,11 @@ unless stated. Medians of `benches/{sign,keygen,e2e}.rs`, with the builds altern
 benchmark on the M4, per group on the Xeon).
 
 - Apple M4 (4 performance and 6 efficiency cores, 16 GB), macOS 27.2. The laptop ran other
-  applications (1-minute load average 2.7 to 5.6 during these runs), so single figures move
-  by a few percent between runs.
+  applications, so single figures move by a few percent between runs. The last round re-measured
+  on the M4 only the rows whose code it changed (SampPre and its batch), with the 1-minute load
+  average below 4 at the start of each section. The other M4 rows are from the round before,
+  with the same code. That includes the thread throughput and the parallel batch, which this
+  round's runs under load could not measure reliably.
 - Intel Xeon Platinum 8581C (Emerald Rapids), a Google Cloud c4-standard-8 VM (4 cores, 8
   threads), Ubuntu 24.04, with nothing else running and the benchmark pinned to one core. Built
   for the default target (x86-64 with SSE2).
@@ -69,65 +77,80 @@ Without the `simd` feature:
 
 | Operation | M4, PCS | M4, Falcon-1024 | Xeon, PCS | Xeon, Falcon-1024 |
 |---|---|---|---|---|
-| TrapGen (fresh seed per iteration) | 5.86 ms | 4.11 ms | 9.64 ms | 6.90 ms |
-| `trapgen_expanded` (TrapGen and the expanded key) | 5.90 ms | 4.06 ms | 9.59 ms | 6.99 ms |
-| NTRUSolve, one solve | 4.56 ms | 2.56 ms | 7.43 ms | 4.53 ms |
-| `ExpandedKey::new` for a generated or decoded key | 51.9 µs | 52.1 µs | 85.0 µs | 85.3 µs |
-| `ExpandedKey::new` for a `from_parts` key (validation included) | 118 µs | 117 µs | 210 µs | 209 µs |
-| SampPre, one call | 133 µs | 163 µs | 255 µs | 288 µs |
-| SampPre throughput, 1 / 2 / 4 / 8 threads sharing one key | 7,240 / 14,650 / 24,430 / 31,960 calls/s | | 3,800 / 7,510 / 14,870 / 17,010 calls/s | |
-| `samp_pre_batch` of 256 calls | 34.4 ms | | 66.6 ms | |
-| Verify | 20.0 µs | 19.9 µs | 42.8 µs | 43.2 µs |
-| `R_q` multiplication | 26.6 µs | 26.3 µs | 50.8 µs | 50.7 µs |
-| `R_q` multiplication by a prepared operand / its preparation | 17.4 µs / 8.25 µs | | 35.5 µs / 14.9 µs | |
-| `PreparedRqPoly::mul_ternary` | 8.7 µs | | 17.6 µs | |
-| sum of four products with ternary operands: `mul` each / `mul_ternary` each / `sum_of_products` | 69.9 / 35.0 / 44.1 µs | | 143 / 71.4 / 84.5 µs | |
-| `R_q` inversion | 55.2 µs | 55.5 µs | 106 µs | 106 µs |
-| invertibility test | 27.2 µs | | 55.0 µs | |
-| `R_q` encoding (`RqPoly::to_bytes`) | 0.49 µs | | 1.00 µs | |
-| `SecretKey::validate` | 66.6 µs | | 125 µs | |
-| secret-key decoding, validation included | 72.7 µs | 72.4 µs | 137 µs | 133 µs |
-| public-key decoding | 2.07 µs | 1.27 µs | 5.32 µs | 3.05 µs |
-| fn-dsa 0.4.0 signing, for comparison | | 219 µs | | 419 µs |
+| TrapGen (fresh seed per iteration) | 5.86 ms | 4.11 ms | 9.35 ms | 6.71 ms |
+| `trapgen_expanded` (TrapGen and the expanded key) | 5.90 ms | 4.06 ms | 9.32 ms | 6.81 ms |
+| NTRUSolve, one solve | 4.56 ms | 2.56 ms | 7.20 ms | 4.38 ms |
+| `ExpandedKey::new` for a generated or decoded key | 51.9 µs | 52.1 µs | 82.5 µs | 82.4 µs |
+| `ExpandedKey::new` for a `from_parts` key (validation included) | 118 µs | 117 µs | 203 µs | 203 µs |
+| SampPre, one call | 135 µs | 158 µs | 248 µs | 277 µs |
+| SampPre throughput, 1 / 2 / 4 / 8 threads sharing one key | 7,240 / 14,650 / 24,430 / 31,960 calls/s | | 3,920 / 7,770 / 15,290 / 17,180 calls/s | |
+| `samp_pre_batch` of 256 calls | 35.2 ms | | 64.9 ms | |
+| Verify | 20.0 µs | 19.9 µs | 41.9 µs | 41.9 µs |
+| `R_q` multiplication | 26.6 µs | 26.3 µs | 50.1 µs | 50.1 µs |
+| `R_q` multiplication by a prepared operand / its preparation | 17.4 µs / 8.25 µs | | 35.0 µs / 14.6 µs | |
+| `PreparedRqPoly::mul_ternary` | 8.7 µs | | 17.3 µs | |
+| sum of four products with ternary operands: `mul` each / `mul_ternary` each / `sum_of_products` | 69.9 / 35.0 / 44.1 µs | | 141 / 69.6 / 82.1 µs | |
+| `R_q` inversion | 55.2 µs | 55.5 µs | 105 µs | 105 µs |
+| invertibility test | 27.2 µs | | 54.6 µs | |
+| `R_q` encoding (`RqPoly::to_bytes`) | 0.49 µs | | 0.88 µs | |
+| `SecretKey::validate` | 66.6 µs | | 121 µs | |
+| secret-key decoding, validation included | 72.7 µs | 72.4 µs | 133 µs | 131 µs |
+| public-key decoding | 2.07 µs | 1.27 µs | 5.19 µs | 3.01 µs |
+| fn-dsa 0.4.0 signing, for comparison | | 219 µs | | 415 µs |
 
-The NTRUSolve and `trapgen_expanded` rows of the M4 are from the previous round of
-measurements (this round did not change that code). The 8-thread rows use hyperthreads on the
-Xeon (4 cores) and efficiency cores on the M4. On the Xeon, the encoding row of this build is
-0.90 µs in the previous commit and 0.89 µs with `simd`, with the same machine code at another
-address: a code-layout effect, which seven alternated rounds confirmed.
+The 8-thread rows use hyperthreads on the Xeon (4 cores) and efficiency cores on the M4. On the
+Xeon the encoding row moves with the code layout alone: 0.98 µs at the previous commit and
+0.88 µs now without `simd`, 0.88 µs and 0.99 µs with it, for the same machine code at another
+address (seven alternated rounds confirmed the effect in the round before).
 
 With the `simd` feature, the same outputs:
 
 | Operation, with `simd` | M4, PCS | M4, Falcon-1024 | Xeon, PCS | Xeon, Falcon-1024 |
 |---|---|---|---|---|
-| TrapGen (fresh seed per iteration) | 5.77 ms | 3.98 ms | 9.26 ms | 6.49 ms |
-| `ExpandedKey::new` for a generated or decoded key | 48.7 µs | 49.3 µs | 79.4 µs | 79.1 µs |
-| `ExpandedKey::new` for a `from_parts` key (validation included) | 80.5 µs | 79.9 µs | 123 µs | 123 µs |
-| SampPre, one call | 130 µs | 157 µs | 204 µs | 239 µs |
-| SampPre throughput, 1 / 2 / 4 / 8 threads sharing one key | 7,690 / 15,650 / 25,860 / 36,310 calls/s | | 4,800 / 8,720 / 17,180 / 25,780 calls/s | |
-| `samp_pre_batch` of 256 calls, sequential / with the `parallel` feature | 29.4 ms / 5.63 ms | | 43.2 ms / 9.16 ms | |
-| Verify | 9.31 µs | 9.43 µs | 10.5 µs | 11.0 µs |
-| `R_q` multiplication | 11.4 µs | 11.2 µs | 13.6 µs | 13.6 µs |
-| `R_q` multiplication by a prepared operand / its preparation | 7.44 µs / 3.27 µs | | 9.08 µs / 4.15 µs | |
-| `PreparedRqPoly::mul_ternary` | 3.72 µs | | 4.86 µs | |
-| sum of four products with ternary operands: `mul` each / `mul_ternary` each / `sum_of_products` | 29.7 / 15.0 / 18.5 µs | | 37.0 / 20.0 / 23.0 µs | |
-| `R_q` inversion | 28.1 µs | 28.1 µs | 36.0 µs | 36.5 µs |
-| invertibility test | 14.5 µs | | 19.3 µs | |
-| `SecretKey::validate` | 32.3 µs | | 43.5 µs | |
-| secret-key decoding, validation included | 38.6 µs | 36.6 µs | 56.6 µs | 53.0 µs |
-| SHAKE256, 64 KiB of output | 79.6 µs | | 125 µs | |
+| TrapGen (fresh seed per iteration) | 5.77 ms | 3.98 ms | 8.93 ms | 6.28 ms |
+| `ExpandedKey::new` for a generated or decoded key | 48.7 µs | 49.3 µs | 78.5 µs | 78.7 µs |
+| `ExpandedKey::new` for a `from_parts` key (validation included) | 80.5 µs | 79.9 µs | 121 µs | 121 µs |
+| SampPre, one call | 127 µs | 148 µs | 201 µs | 229 µs |
+| SampPre throughput, 1 / 2 / 4 / 8 threads sharing one key | 7,690 / 15,650 / 25,860 / 36,310 calls/s | | 4,860 / 9,740 / 19,390 / 27,000 calls/s | |
+| `samp_pre_batch` of 256 calls, sequential / with the `parallel` feature | 30.8 ms / 5.63 ms | | 42.8 ms / 8.91 ms | |
+| Verify | 9.31 µs | 9.43 µs | 10.6 µs | 10.9 µs |
+| `R_q` multiplication | 11.4 µs | 11.2 µs | 13.5 µs | 13.5 µs |
+| `R_q` multiplication by a prepared operand / its preparation | 7.44 µs / 3.27 µs | | 8.99 µs / 4.08 µs | |
+| `PreparedRqPoly::mul_ternary` | 3.72 µs | | 4.83 µs | |
+| sum of four products with ternary operands: `mul` each / `mul_ternary` each / `sum_of_products` | 29.7 / 15.0 / 18.5 µs | | 36.6 / 19.8 / 22.7 µs | |
+| `R_q` inversion | 28.1 µs | 28.1 µs | 35.3 µs | 35.5 µs |
+| invertibility test | 14.5 µs | | 19.0 µs | |
+| `SecretKey::validate` | 32.3 µs | | 42.0 µs | |
+| secret-key decoding, validation included | 38.6 µs | 36.6 µs | 54.7 µs | 51.3 µs |
+| SHAKE256, 64 KiB of output | 79.6 µs | | 124 µs | |
 
 On the M4 the TrapGen rows of both tables are medians of three runs of a separate timing
 program (21 batches of 10 keys each), because criterion's TrapGen figures moved by 5 % with the
 load there. With `simd` on x86-64 SampPre runs its x86-64-v3 copy, so building with
 `-C target-cpu=x86-64-v3` is no longer needed for it.
 
+On a Google Axion (Neoverse V2, a c4a-standard-4 VM with 4 cores, Ubuntu 24.04) SampPre takes
+203 µs at `Params::PCS` and 226 µs at Falcon-1024 without `simd`, and 193 µs and 216 µs with
+it. Verify takes 37.2 µs and 21.3 µs, a product in `R_q` 48.7 µs and 28.1 µs. With `simd`,
+`samp_pre_batch` runs 256 calls in 44.6 ms, and in 11.5 ms with the `parallel` feature, with
+the three-state Keccak kernel. SHAKE256 gives 64 KiB of output in 129 µs (textbook form).
+
 At `Params::PCS` with `simd` on the Xeon, SampPre spends 54 % of its time in the leaf sampler
 (whose chain of dependent floating-point operations is the bottleneck), 28 % in Keccak, about
-8 % in the FFT passes and about 5 % in the rest (profile of the final tree). The leaf sampler
-costs 83 ns per sample on the Xeon and 47.5 ns on the M4 (`sampler/leaf/pcs_2.6`, with the
-SHAKE256 reads), for 2048 samples per call. TrapGen is dominated by NTRUSolve on resultants of
+8 % in the FFT passes and about 5 % in the rest (profile of the round before). The leaf
+sampler costs 80.7 ns per sample on the Xeon and 49.0 ns on the M4 (`sampler/leaf/pcs_2.6`,
+with the SHAKE256 reads), for 2048 samples per call. TrapGen is dominated by NTRUSolve on resultants of
 about 9.6 kbit, with 20.2 candidates per key on average.
+
+Profile-guided optimization belongs to the binary that uses the crate, not to the crate. It was
+measured on an intermediate tree of this round (before the tie fix and the three-state Keccak
+kernel), with rustc's `-Cprofile-generate` and `-Cprofile-use` and a profile of the benchmarks
+(SampPre, the leaf sampler, Verify, the products, the inversion, the encoding, the expanded key
+and a batch). The known-answer and parity tests pass with the profile. SampPre at
+`Params::PCS` took 4.8 % less time on the Xeon without `simd` and 1.3 % less with it, and 1.1 %
+and 2.1 % less on a Google Axion (Neoverse V2). Verify took 1.6 % and 7.7 % more time on the
+Xeon, and the product and the inversion up to 3.7 % more on the Axion without `simd`, so the
+profile is no clear gain.
 
 ## Interoperability with fn-dsa
 
@@ -142,9 +165,9 @@ fn-dsa's verifying key stores `h` in its NTT representation, not in coefficient 
   processors and compilers have not been tested.
 - With the `simd` feature the whole suite passes, the long tests included, on the Xeon
   (AVX-512, AVX2, BMI1, BMI2), on the M4 (NEON and SHA3) and on a Google Axion (Neoverse V2,
-  NEON, where the SHA3 kernels are not used), and again with `NTRU_TRAPDOOR_SCALAR` set and
-  with the `parallel` feature. On the Xeon the unit, known-answer and parity tests also pass
-  with `-C target-cpu=x86-64-v3`. The kernel tests run every kernel that the processor has
+  NEON, and SHA3 in the Keccak kernels of the batches), and again with `NTRU_TRAPDOOR_SCALAR`
+  set and with the `parallel` feature. On the Xeon the unit, known-answer and parity tests also
+  pass with `-C target-cpu=x86-64-v3`. The kernel tests run every kernel that the processor has
   directly against the portable code, on random values and on extreme ones (0, 1 and p − 1,
   signed zeros in the FFT, states with distinct lanes in Keccak). Two dispatch paths were not
   run end to end: an x86-64 processor with AVX2 but without AVX-512 (whose kernels the Xeon

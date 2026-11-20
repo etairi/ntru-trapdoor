@@ -9,8 +9,9 @@
 //!   portable code compiled for AVX2, BMI1, BMI2, LZCNT and POPCNT (`andn`, `rorx`). On Apple's
 //!   aarch64 processors the SHA3 extension.
 //! - Keccak-f\[1600\] on several independent states at once, for batches of SHAKE256 streams:
-//!   four with AVX-512VL or AVX2 and eight with AVX-512 (x86-64), two with the SHA3 extension
-//!   (aarch64).
+//!   four with AVX-512VL or AVX2 and eight with AVX-512 (x86-64), two or three with the SHA3
+//!   extension (aarch64: three with two states in vector registers and one in general-purpose
+//!   registers).
 //! - The two-prime NTT: the layers with half-blocks of at least 8 values (x86-64: AVX-512F with
 //!   16 lanes from 16 values when the processor has it, AVX2 with 8 lanes otherwise) or 4 values
 //!   (aarch64: NEON, 4 lanes), the narrow layers below them with the lanes regrouped in
@@ -138,8 +139,8 @@ pub(crate) fn sha3() -> bool {
 /// The SHA3 kernel computes one state in registers that hold two, so it needs processors that
 /// run the SHA3 instructions as fast as the other vector instructions. An Apple M4 does, and the
 /// kernel is faster than the portable code there. A Neoverse V2 runs one SHA3 instruction per
-/// cycle, and the kernel took 517 ns per permutation there, against 293 ns for the portable code.
-/// Other aarch64 processors keep the portable code.
+/// cycle, and the kernel took 517 ns per permutation there, against 267 ns for the textbook form.
+/// Other aarch64 processors keep the portable code (textbook form).
 #[inline]
 pub(crate) fn keccak_f1600(state: &mut [u64; 25]) -> bool {
     #[cfg(target_arch = "x86_64")]
@@ -168,18 +169,50 @@ pub(crate) fn keccak_f1600(state: &mut [u64; 25]) -> bool {
 
 /// Keccak-f\[1600\] on two independent states at once, with the SHA3 extension (aarch64):
 /// `true` if it ran (then each state is permuted, as by the portable code), `false` otherwise
-/// (the states untouched). Together with [`keccak_f1600_x4`] and [`keccak_f1600_x8`], a caller
-/// can try the widest kernel first.
+/// (the states untouched). Together with [`keccak_f1600_x3`], [`keccak_f1600_x4`] and
+/// [`keccak_f1600_x8`], a caller can try the widest kernel first.
+///
+/// Apple's processors run the kernel of SHA3 instructions only. Other processors run the mixed
+/// kernel, which leaves part of each round to the other vector instructions: a Neoverse V2 runs
+/// one SHA3 instruction per cycle, and there the mixed kernel took 177 ns per state against
+/// 261 ns for the other one and 267 ns for one state in the textbook form.
 #[cfg_attr(
     not(test),
     allow(dead_code, reason = "for batches of SHAKE256 streams")
 )]
 #[inline]
 pub(crate) fn keccak_f1600_x2(states: &mut [[u64; 25]; 2]) -> bool {
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
     if sha3() {
         // SAFETY: the processor has the SHA3 extension (`sha3`).
         unsafe { keccak_neon::keccak_f1600_x2(states) };
+        return true;
+    }
+    #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+    if sha3() {
+        // SAFETY: the processor has the SHA3 extension (`sha3`).
+        unsafe { keccak_neon::keccak_f1600_x2_mixed(states) };
+        return true;
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    let _ = states;
+    false
+}
+
+/// Keccak-f\[1600\] on three independent states at once, with the SHA3 extension (aarch64):
+/// two in vector registers and one in general-purpose registers, in the same rounds. `true` if
+/// it ran (then each state is permuted, as by the portable code), `false` otherwise (the states
+/// untouched).
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "for batches of SHAKE256 streams")
+)]
+#[inline]
+pub(crate) fn keccak_f1600_x3(states: &mut [[u64; 25]; 3]) -> bool {
+    #[cfg(target_arch = "aarch64")]
+    if sha3() {
+        // SAFETY: the processor has the SHA3 extension (`sha3`).
+        unsafe { keccak_neon::keccak_f1600_x3(states) };
         return true;
     }
     #[cfg(not(target_arch = "aarch64"))]

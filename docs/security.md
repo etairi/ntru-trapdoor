@@ -89,6 +89,16 @@ fn-dsa's). The following run in variable time:
   with the trial's outcome that event depends on the inputs, as the second byte of the lazy
   comparison already does.
 
+Source code without a branch can still compile to one. Releases up to 0.1.2 test for a tie of
+the width-3.1 base draw with an OR of 28 equalities, which rustc 1.100.0 compiles to a tree of
+branches on the draw (checked for 0.1.2 on x86-64 and aarch64). The path through that tree gives
+away the base sample of every trial to an observer of the branches, on a shared core or in power
+or electromagnetic traces. The timing of whole calls does not depend on the key through it, since
+the draws do not. The scan now takes the tie from the same sums as the count (the sampler's
+documentation, `scan_top`). `tools/sampler_branches.py`, which CI runs on x86-64 and aarch64
+with both toolchains, fails if the optimized code branches on a comparison with the table's
+entries. It reads LLVM's IR, not the machine code.
+
 The `simd` feature (off by default) adds the crate's only `unsafe` code, in one module
 (`src/simd`): SIMD kernels chosen at run time, each with the same results as the portable code
 it replaces, which the tests compare. Like that code, the kernels do not branch on data and

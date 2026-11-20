@@ -52,6 +52,23 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test --locked --release -- --ignored
+  branches:
+    # The compiled base sampler does not branch on the draw: tools/sampler_branches.py reads
+    # the optimized LLVM IR, default build and simd, with both toolchains (another LLVM may
+    # compile the same source differently).
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+        toolchain: ['1.95.0', stable]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+      - run: python3 tools/sampler_branches.py
+      - run: python3 tools/sampler_branches.py --features simd
   cross:
     # The library for i686 (32-bit usize) and wasm32. A check only: the tests' Criterion
     # dependency needs a C compiler for the target.

@@ -113,6 +113,12 @@ fn keccak_kernels_equal_portable() {
         // SAFETY: as above.
         let f = |s: &mut _| unsafe { keccak_neon::keccak_f1600_x2(s) };
         check_keccak_n::<2>("x2 sha3", &states, f);
+        // SAFETY: as above.
+        let f = |s: &mut _| unsafe { keccak_neon::keccak_f1600_x2_mixed(s) };
+        check_keccak_n::<2>("x2 mixed", &states, f);
+        // SAFETY: as above.
+        let f = |s: &mut _| unsafe { keccak_neon::keccak_f1600_x3(s) };
+        check_keccak_n::<3>("x3 hybrid", &states, f);
     }
 }
 
@@ -137,6 +143,10 @@ fn keccak_dispatch_equals_portable() {
     check_keccak_n::<2>("keccak_f1600_x2", &states, |s| {
         let before = *s;
         or_portable(keccak_f1600_x2(s), &before, s);
+    });
+    check_keccak_n::<3>("keccak_f1600_x3", &states, |s| {
+        let before = *s;
+        or_portable(keccak_f1600_x3(s), &before, s);
     });
     check_keccak_n::<4>("keccak_f1600_x4", &states, |s| {
         let before = *s;
@@ -214,6 +224,12 @@ fn keccak_timings() {
         // SAFETY: as above.
         let f = |s: &mut _| unsafe { keccak_neon::keccak_f1600_x2(s) };
         kernels.push(many::<2>("x2 sha3", f));
+        // SAFETY: as above.
+        let f = |s: &mut _| unsafe { keccak_neon::keccak_f1600_x2_mixed(s) };
+        kernels.push(many::<2>("x2 mixed", f));
+        // SAFETY: as above.
+        let f = |s: &mut _| unsafe { keccak_neon::keccak_f1600_x3(s) };
+        kernels.push(many::<3>("x3 hybrid", f));
     }
     kernels.push(one("dispatch", |s| {
         if !keccak_f1600(s) {
@@ -240,6 +256,55 @@ fn keccak_timings() {
             "keccak {name:>10}: {med:7.1} ns per call, {:6.1} ns per state (min {lo:.1}, max {hi:.1})",
             med / *ways as f64
         );
+    }
+}
+
+/// `samp_pre_batch` returns what `samp_pre` returns, call by call, for 1 to 5, 7 and 256 calls
+/// (groups of every width up to 8, with and without calls left over), and so it does for a key
+/// that allows no attempt, which `samp_pre_group` runs call by call (`Params::validate` refuses
+/// such a key, so that guard is reached only from inside the crate).
+#[test]
+fn samp_pre_batch_sizes_equal_samp_pre() {
+    let params = crate::Params::PCS;
+    let (_, sk) = crate::trapgen(&params, &[0x64; 32]).unwrap();
+    let ek = crate::ExpandedKey::new(&sk).unwrap();
+    let mut rng = Shake256Prng::new(b"batch-sizes");
+    let targets: Vec<crate::RqPoly> = (0..256)
+        .map(|_| {
+            let c: Vec<u32> = (0..params.n())
+                .map(|_| (rng.next_u64() % params.q as u64) as u32)
+                .collect();
+            crate::RqPoly::from_coeffs(&params, &c).unwrap()
+        })
+        .collect();
+    let seeds: Vec<[u8; 32]> = (0..256u32)
+        .map(|i| core::array::from_fn(|j| (i as u8).wrapping_mul(29) ^ j as u8))
+        .collect();
+    let items: Vec<(&crate::RqPoly, &[u8; 32])> = targets.iter().zip(seeds.iter()).collect();
+    let want: Vec<_> = items
+        .iter()
+        .map(|&(t, seed)| crate::samp_pre(&ek, t, seed))
+        .collect();
+    for n in [1, 2, 3, 4, 5, 7, 256] {
+        assert_eq!(
+            crate::samp_pre_batch(&ek, &items[..n]),
+            want[..n],
+            "{n} calls"
+        );
+    }
+    let mut none = crate::ExpandedKey::new(&sk).unwrap();
+    none.params.samppre_max_attempts = 0;
+    for n in [1, 2, 3, 4, 5, 7] {
+        let got = crate::samp_pre_batch(&none, &items[..n]);
+        assert_eq!(got.len(), n);
+        for (i, (g, &(t, seed))) in got.iter().zip(items.iter()).enumerate() {
+            assert_eq!(g, &crate::samp_pre(&none, t, seed), "{n} calls, item {i}");
+            assert_eq!(
+                g,
+                &Err(crate::Error::SampPreExhausted),
+                "{n} calls, item {i}"
+            );
+        }
     }
 }
 

@@ -102,10 +102,11 @@ pub fn samp_pre(ek: &ExpandedKey, t: &RqPoly, seed: &[u8; 32]) -> Result<Preimag
 /// otherwise one after the other.
 ///
 /// With the `simd` feature, on processors with a multi-state Keccak kernel (8 states with
-/// AVX-512, 4 with AVX2, 2 with the SHA3 extension of aarch64), the calls go in groups: their
-/// seed derivations run together, and so do the first blocks of their PRNG streams (about as
-/// many blocks as an attempt reads, `presqueeze_blocks`), squeezed before the sampling starts.
-/// Each call reads the bytes of its own stream, so the outputs are those of `samp_pre`.
+/// AVX-512, 4 with AVX2, 3 with the SHA3 extension of aarch64, 2 on Apple's processors), the
+/// calls go in groups: their seed derivations run together, and so do the first blocks of their
+/// PRNG streams (about as many blocks as an attempt reads, `presqueeze_blocks`), squeezed before
+/// the sampling starts. Each call reads the bytes of its own stream, so the outputs are those of
+/// `samp_pre`.
 pub fn samp_pre_batch(
     ek: &ExpandedKey,
     items: &[(&RqPoly, &[u8; 32])],
@@ -114,7 +115,8 @@ pub fn samp_pre_batch(
     #[cfg(feature = "parallel")]
     {
         use rayon::prelude::*;
-        // Groups no larger than the calls per thread, so that every thread has work.
+        // Groups no larger than the calls per thread, so that every thread has work: a power of
+        // two from 1 to `per_thread` when that is below the kernel's width (which may be 3).
         let per_thread = (items.len() / rayon::current_num_threads()).max(1);
         let group = if per_thread >= group {
             group

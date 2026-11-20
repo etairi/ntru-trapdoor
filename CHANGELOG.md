@@ -4,11 +4,13 @@ All notable changes to this crate. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the crate follows
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.1.3] - 2026-11-19
 
-Faster, with the same outputs as 0.1.2: the known-answer tests and the fn-dsa parity tests pass
-unchanged, with and without the new feature. Figures below are against 0.1.2 on an Intel Xeon
-8581C and an Apple M4.
+Faster, with the same outputs, and a side-channel fix. For the same inputs and seeds, every key,
+preimage, product and encoding is the same bytes as in 0.1.2, with and without the new feature.
+The known-answer tests and the fn-dsa parity tests pass unchanged, so the seed label stays
+`ntru-trapdoor/v1/samp-pre`. Figures below are against 0.1.2 on an Intel Xeon 8581C and an Apple
+M4.
 
 ### Added
 
@@ -23,25 +25,48 @@ unchanged, with and without the new feature. Figures below are against 0.1.2 on 
   - aarch64: NEON for the FFT passes, the NTT and the same code around it, and the SHA3
     extension for Keccak on Apple's processors.
   - `samp_pre_batch` derives the seeds of several calls together and squeezes the first blocks
-    of their PRNG streams together, 8 streams at a time with AVX-512, 4 with AVX2 and 2 on
-    Apple's processors. Each call still reads its own stream.
-  - With it, on the Xeon, SampPre takes 30 % less time at `Params::PCS` and 28 % less at
-    Falcon-1024, Verify 76 % less, a product in `R_q` 73 % less and a batch of 256 calls 43 %
-    less. On the M4: 14 %, 14 %, 53 %, 56 % and 19 % less.
+    of their PRNG streams together, 8 streams at a time with AVX-512, 4 with AVX2, 2 on Apple's
+    processors and 3 on other aarch64 processors with the SHA3 extension. Each call still reads
+    its own stream. The three-state kernel holds two states in vector registers, with SHA3
+    instructions mixed with the other vector instructions, and the third in general-purpose
+    registers. On a Google Axion (Neoverse V2) it takes 122 ns per state, against 267 ns for one
+    state in the textbook form (below).
+  - With it, on the Xeon, SampPre takes 29 % less time at `Params::PCS` and 29 % less at
+    Falcon-1024, Verify 74 % less, a product in `R_q` 73 % less and a batch of 256 calls 42 %
+    less. On the M4: 20 %, 18 %, 52 %, 58 % and 17 % less.
 
 ### Changed
 
-- SampPre is faster without the feature too: 12 % at `Params::PCS` and 13 % at Falcon-1024 on
-  the Xeon, 9 % and 10 % on the M4.
+- SampPre is faster without the feature too: 12 % at `Params::PCS` and 14 % at Falcon-1024 on
+  the Xeon, 14 % and 12 % on the M4.
   - The Bernoulli step decides its first byte from an `f64` estimate of the threshold and
     computes FACCT's polynomial only in 2 of 256 trials, with the same result and the same PRNG
     bytes (a lemma, recorded in the sampler's documentation). That byte is compared with the
-    estimate in floating point, without a conversion to an integer.
+    estimate in floating point, without a conversion to an integer and without subtracting
+    1/32 from the estimate first, an exact rewriting of the same comparison.
+  - On aarch64, and in SampPre's x86-64-v3 copy, the sampler takes integer parts with one
+    rounding instruction (`floor`, `trunc`) rather than a conversion to an integer and back,
+    with the same values.
   - ffSampling's nodes of degree 4 are unrolled.
   - fn-dsa's base sampler reads its table by columns, which the compiler vectorizes: the same
     comparison on every row.
+- On aarch64 the Keccak permutation of SHAKE256 runs in the textbook form (θ, ρ and π, then χ
+  with `BIC`), which compiles to fewer instructions there than fn-dsa's lane-complementing form.
+  That form stays the reference and the code of other processors. SHAKE256 is 10 % faster on a
+  Google Axion and as fast as before on the M4.
 - `RqPoly::to_bytes` and `PublicKey::to_bytes` write 32 bits at a time: 2.4 times faster on the
-  M4 and 2.7 times on the Xeon, with the same bytes.
+  M4 and 2.6 to 2.9 times on the Xeon (with the code layout), with the same bytes.
+
+### Fixed
+
+- The base sampler of `Params::PCS` (width 3.1) no longer branches on the draw. Every release
+  tests for a tie of the draw's top bits with a table entry by an OR of 28 equalities, which
+  rustc 1.100.0 compiles to a tree of branches on the draw (checked for 0.1.2 on x86-64 and
+  aarch64, security.md, "Side channels"). The tie now comes from sums over every entry, with
+  the same results. Measured alone, this makes SampPre at `Params::PCS` 7 to 8 % slower on a
+  Google Axion (Neoverse V2), 4 % slower on the Xeon with `simd` and no slower without it.
+  Falcon-1024's base sampler, fn-dsa's, is not affected. `tools/sampler_branches.py` checks the
+  compiled code, and CI runs it.
 
 ## [0.1.2] - 2026-11-19
 

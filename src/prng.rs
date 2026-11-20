@@ -502,14 +502,101 @@ macro_rules! keccak_f1600_body {
 /// `simd` feature a kernel with the same results runs instead on processors that have the
 /// instructions (module `simd`): on x86-64 AVX-512, else the same code compiled for AVX2, BMI1,
 /// BMI2, LZCNT and POPCNT (`andn`, `rorx`), and on Apple's aarch64 processors the SHA3
-/// extension.
+/// extension. Otherwise aarch64 runs the textbook form ([`keccak_f1600_textbook`]).
 #[inline]
 fn keccak_f1600(state: &mut [u64; 25]) {
     #[cfg(all(feature = "simd", any(target_arch = "x86_64", target_arch = "aarch64")))]
     if crate::simd::keccak_f1600(state) {
         return;
     }
+    #[cfg(target_arch = "aarch64")]
+    keccak_f1600_textbook(state);
+    #[cfg(not(target_arch = "aarch64"))]
     keccak_f1600_portable(state)
+}
+
+/// One round of Keccak-f\[1600\] in the textbook form, lane by lane: θ, ρ and π into the lanes
+/// `b`, then χ as $`b_i\oplus(\lnot b_{i+1}\wedge b_{i+2})`$ and ι. On aarch64 χ takes `BIC` and
+/// `EOR`, and LLVM folds most rotations into the operands of `EOR`, which the
+/// lane-complementing form of [`keccak_f1600_portable`] (written for x86-64, where `andn`
+/// needs BMI1) cannot use as well. A version with loops over the lanes made the three-state
+/// kernel of the `simd` module 9 % slower on a Neoverse V2.
+#[inline(always)]
+pub(crate) fn keccak_round_textbook(s: &mut [u64; 25], rc: u64) {
+    let c0 = s[0] ^ s[5] ^ s[10] ^ s[15] ^ s[20];
+    let c1 = s[1] ^ s[6] ^ s[11] ^ s[16] ^ s[21];
+    let c2 = s[2] ^ s[7] ^ s[12] ^ s[17] ^ s[22];
+    let c3 = s[3] ^ s[8] ^ s[13] ^ s[18] ^ s[23];
+    let c4 = s[4] ^ s[9] ^ s[14] ^ s[19] ^ s[24];
+    let d0 = c4 ^ c1.rotate_left(1);
+    let d1 = c0 ^ c2.rotate_left(1);
+    let d2 = c1 ^ c3.rotate_left(1);
+    let d3 = c2 ^ c4.rotate_left(1);
+    let d4 = c3 ^ c0.rotate_left(1);
+    let b0 = s[0] ^ d0;
+    let b1 = (s[6] ^ d1).rotate_left(44);
+    let b2 = (s[12] ^ d2).rotate_left(43);
+    let b3 = (s[18] ^ d3).rotate_left(21);
+    let b4 = (s[24] ^ d4).rotate_left(14);
+    let b5 = (s[3] ^ d3).rotate_left(28);
+    let b6 = (s[9] ^ d4).rotate_left(20);
+    let b7 = (s[10] ^ d0).rotate_left(3);
+    let b8 = (s[16] ^ d1).rotate_left(45);
+    let b9 = (s[22] ^ d2).rotate_left(61);
+    let b10 = (s[1] ^ d1).rotate_left(1);
+    let b11 = (s[7] ^ d2).rotate_left(6);
+    let b12 = (s[13] ^ d3).rotate_left(25);
+    let b13 = (s[19] ^ d4).rotate_left(8);
+    let b14 = (s[20] ^ d0).rotate_left(18);
+    let b15 = (s[4] ^ d4).rotate_left(27);
+    let b16 = (s[5] ^ d0).rotate_left(36);
+    let b17 = (s[11] ^ d1).rotate_left(10);
+    let b18 = (s[17] ^ d2).rotate_left(15);
+    let b19 = (s[23] ^ d3).rotate_left(56);
+    let b20 = (s[2] ^ d2).rotate_left(62);
+    let b21 = (s[8] ^ d3).rotate_left(55);
+    let b22 = (s[14] ^ d4).rotate_left(39);
+    let b23 = (s[15] ^ d0).rotate_left(41);
+    let b24 = (s[21] ^ d1).rotate_left(2);
+    s[0] = b0 ^ (!b1 & b2) ^ rc;
+    s[1] = b1 ^ (!b2 & b3);
+    s[2] = b2 ^ (!b3 & b4);
+    s[3] = b3 ^ (!b4 & b0);
+    s[4] = b4 ^ (!b0 & b1);
+    s[5] = b5 ^ (!b6 & b7);
+    s[6] = b6 ^ (!b7 & b8);
+    s[7] = b7 ^ (!b8 & b9);
+    s[8] = b8 ^ (!b9 & b5);
+    s[9] = b9 ^ (!b5 & b6);
+    s[10] = b10 ^ (!b11 & b12);
+    s[11] = b11 ^ (!b12 & b13);
+    s[12] = b12 ^ (!b13 & b14);
+    s[13] = b13 ^ (!b14 & b10);
+    s[14] = b14 ^ (!b10 & b11);
+    s[15] = b15 ^ (!b16 & b17);
+    s[16] = b16 ^ (!b17 & b18);
+    s[17] = b17 ^ (!b18 & b19);
+    s[18] = b18 ^ (!b19 & b15);
+    s[19] = b19 ^ (!b15 & b16);
+    s[20] = b20 ^ (!b21 & b22);
+    s[21] = b21 ^ (!b22 & b23);
+    s[22] = b22 ^ (!b23 & b24);
+    s[23] = b23 ^ (!b24 & b20);
+    s[24] = b24 ^ (!b20 & b21);
+}
+
+/// Keccak-f\[1600\] with [`keccak_round_textbook`]: the same permutation as
+/// [`keccak_f1600_portable`] (test `textbook_equals_portable`), which aarch64 runs when no kernel
+/// of the `simd` feature does. On a Neoverse V2 it took 267 ns against 293 ns for the
+/// lane-complementing form. A plain function, like [`keccak_f1600_portable`].
+#[cfg_attr(
+    not(target_arch = "aarch64"),
+    allow(dead_code, reason = "aarch64 only, and tests")
+)]
+pub(crate) fn keccak_f1600_textbook(state: &mut [u64; 25]) {
+    for &rc in RC.iter() {
+        keccak_round_textbook(state, rc);
+    }
 }
 
 /// [`keccak_f1600`] for any processor. A plain function, as `keccak_f1600` was in 0.1.2: forcing
@@ -519,6 +606,10 @@ fn keccak_f1600(state: &mut [u64; 25]) {
     clippy::assign_op_pattern,
     clippy::identity_op,
     clippy::manual_rotate
+)]
+#[cfg_attr(
+    target_arch = "aarch64",
+    allow(dead_code, reason = "the reference that the tests compare with")
 )]
 #[rustfmt::skip]
 pub(crate) fn keccak_f1600_portable(state: &mut [u64; 25]) {
@@ -793,10 +884,11 @@ impl Drop for Shake256Prng {
 }
 
 /// The number of independent Keccak states that a multi-state kernel of this processor
-/// permutes at once (8, 4 or 2), or 1 without one. On aarch64 only Apple's processors count:
-/// the two-state SHA3 kernel takes 83 ns per state against 165 ns for one state on an M4, but
-/// 261 ns against 293 ns for the portable code on a Neoverse V2, where `samp_pre_batch` was
-/// faster call by call.
+/// permutes at once (8, 4, 3 or 2), or 1 without one. On Apple's processors the two-state SHA3
+/// kernel takes 83 ns per state against 165 ns for one state (M4). On other aarch64 processors
+/// with the SHA3 extension the three-state kernel, two states in vector registers and one in
+/// general-purpose registers, took 122 ns per state on a Neoverse V2, against 267 ns for one
+/// state in the textbook form.
 pub(crate) fn keccak_lanes() -> usize {
     #[cfg(all(feature = "simd", target_arch = "x86_64"))]
     {
@@ -811,11 +903,19 @@ pub(crate) fn keccak_lanes() -> usize {
     if crate::simd::sha3() {
         return 2;
     }
+    #[cfg(all(
+        feature = "simd",
+        target_arch = "aarch64",
+        not(target_vendor = "apple")
+    ))]
+    if crate::simd::sha3() {
+        return 3;
+    }
     1
 }
 
 /// Keccak-f\[1600\] on every state, with the multi-state kernels where they apply (groups of 8,
-/// 4 or 2) and one state at a time for the rest: each state as [`keccak_f1600`] permutes it.
+/// 4, 3 or 2) and one state at a time for the rest: each state as [`keccak_f1600`] permutes it.
 fn keccak_many(states: &mut [[u64; 25]]) {
     #[cfg(feature = "simd")]
     let states = keccak_many_simd(states);
@@ -845,7 +945,18 @@ fn keccak_many_simd(states: &mut [[u64; 25]]) -> &mut [[u64; 25]] {
         }
         rest = tail;
     }
-    if lanes == 2 {
+    #[cfg(target_arch = "aarch64")]
+    if lanes == 3 {
+        let (groups, tail) = rest.as_chunks_mut::<3>();
+        for g in groups {
+            if !crate::simd::keccak_f1600_x3(g) {
+                g.iter_mut().for_each(keccak_f1600);
+            }
+        }
+        rest = tail;
+    }
+    // Two states left by the three-state kernel go through the two-state one.
+    if lanes == 2 || (cfg!(target_arch = "aarch64") && lanes == 3) {
         let (groups, tail) = rest.as_chunks_mut::<2>();
         for g in groups {
             if !crate::simd::keccak_f1600_x2(g) {
@@ -949,6 +1060,29 @@ pub fn shake256(parts: &[&[u8]], out: &mut [u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The textbook permutation equals the lane-complementing one: on the zero state, the
+    /// all-ones state, every single-bit state and random states (aarch64 runs the first, other
+    /// processors the second).
+    #[test]
+    fn textbook_equals_portable() {
+        let mut states: Vec<[u64; 25]> = vec![[0; 25], [u64::MAX; 25]];
+        for bit in 0..1600 {
+            let mut st = [0u64; 25];
+            st[bit / 64] = 1 << (bit % 64);
+            states.push(st);
+        }
+        let mut rng = Shake256Prng::new(b"textbook-keccak");
+        for _ in 0..2000 {
+            states.push(core::array::from_fn(|_| rng.next_u64()));
+        }
+        for st in states {
+            let (mut a, mut b) = (st, st);
+            keccak_f1600_portable(&mut a);
+            keccak_f1600_textbook(&mut b);
+            assert_eq!(a, b);
+        }
+    }
 
     /// NIST SHAKE256 vectors, as in fn-dsa's tests (fn-dsa-comm/src/shake.rs:822-833):
     /// input (hex), output (hex). Also checked with Python's `hashlib.shake_256`.

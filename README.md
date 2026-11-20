@@ -53,7 +53,8 @@ chooses SIMD kernels at run time, with the same outputs, in the crate's only mod
 - On aarch64, the FFT passes, the NTT, the CRT and Verify run with NEON, and Keccak with the
   SHA3 extension on Apple's processors.
 - `samp_pre_batch` derives the seeds of several calls and squeezes their PRNG streams
-  together, 8 at a time with AVX-512, 4 with AVX2 and 2 on Apple's processors.
+  together, 8 at a time with AVX-512, 4 with AVX2, 2 on Apple's processors and 3 on other
+  aarch64 processors with the SHA3 extension.
 
 The environment variable `NTRU_TRAPDOOR_SCALAR` keeps the portable code.
 
@@ -135,16 +136,16 @@ Xeon (x86-64) table and the setup.
 |---|---|---|---|---|
 | key generation (`trapgen`) | 5.9 ms | 4.1 ms | 5.8 ms | 4.0 ms |
 | sampling tree (`ExpandedKey::new`) | 52 µs | 52 µs | 49 µs | 49 µs |
-| preimage (`samp_pre`) | 133 µs | 163 µs | 130 µs | 157 µs |
+| preimage (`samp_pre`) | 135 µs | 158 µs | 127 µs | 148 µs |
 | `verify` | 20 µs | 20 µs | 9.3 µs | 9.4 µs |
 | `R_q` multiplication / inversion | 27 µs / 55 µs | 26 µs / 56 µs | 11 µs / 28 µs | 11 µs / 28 µs |
 
-On the Xeon, with `simd`, a preimage takes 204 µs at `Params::PCS` against 255 µs without it,
-and Verify 10.5 µs against 43 µs. For comparison, fn-dsa 0.4.0 signs a Falcon-1024 message in
-213 µs on the M4 and 434 µs on the Xeon, where this crate samples a Falcon-1024 preimage, tree
-included, in 203 µs and 326 µs with `simd`. Sampling scales with threads that share one key:
+On the Xeon, with `simd`, a preimage takes 201 µs at `Params::PCS` against 248 µs without it,
+and Verify 10.6 µs against 42 µs. For comparison, fn-dsa 0.4.0 signs a Falcon-1024 message in
+209 µs on the M4 and 415 µs on the Xeon, where this crate samples a Falcon-1024 preimage, tree
+included, in 193 µs and 307 µs with `simd`. Sampling scales with threads that share one key:
 about 36,000 preimages per second on 8 threads of the M4 at `Params::PCS` with `simd`, and
-`samp_pre_batch` runs 256 calls in 29 ms on one M4 core with `simd`.
+`samp_pre_batch` runs 256 calls in 31 ms on one M4 core with `simd`.
 
 ## Documentation
 
