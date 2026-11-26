@@ -2,7 +2,7 @@
 """The sampling tables of ntru-trapdoor, `src/tables.rs`, computed from their definition.
 
 A port of Jali's `tools/kat/half_gaussian_cdf.py` (https://github.com/etairi/jali, commit
-0cd24f3; same author, MIT), generalised to any width and precision.
+9c5d493; same author, MIT), generalised to any width and precision.
 
 Every table is the reverse CDT of a half-Gaussian K on {0, 1, 2, ...} with
 Pr[K = i] proportional to rho(i) = exp(-(num/den) i^2), that is of width sigma with
