@@ -22,9 +22,9 @@ ntru-trapdoor is research code, version 0.1.
 - **Not audited.** No independent review of the code has taken place.
 - **Checked against fn-dsa.** At Falcon-1024's parameters, the preimage sampler reproduces Thomas
   Pornin's [fn-dsa](https://github.com/pornin/rust-fn-dsa) signatures bit for bit.
-- **No constant-time guarantee.** The sampler keeps Falcon's isochronous structure, but native
-  floating point, the rejection loops and key generation run in variable time. See the
-  [security notes](docs/security.md).
+- **No constant-time guarantee.** The sampler keeps Falcon's isochronous structure and rounds
+  without library calls, but native floating point, the rejection loops and key generation run
+  in variable time. See the [security notes](docs/security.md).
 - **Distribution.** The sampling tables and rejection steps are exact. The floating-point error
   of the fast Fourier sampler is measured, not bounded a priori. See
   [distribution and precision](docs/precision.md).

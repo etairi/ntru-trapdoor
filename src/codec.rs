@@ -17,6 +17,8 @@
 
 use zeroize::{Zeroize, Zeroizing};
 
+use crate::wipe::Secret;
+
 use crate::{Error, Params, PublicKey, RqPoly, SecretKey};
 
 /// The secret-key header byte: `0xA0 | logn`.
@@ -54,17 +56,19 @@ fn encode_poly(x: &[i16], w: u32, out: &mut Vec<u8>) {
     if acc_len > 0 {
         out.push(acc as u8);
     }
-    acc.zeroize();
+    if crate::wipe::ENABLED {
+        acc.zeroize();
+    }
 }
 
 /// Decodes `n` coefficients at `w` bits from exactly `poly_bytes(n, w)` bytes; fn-dsa
 /// `trim_i8_decode` (fn-dsa-comm/src/codec.rs:39-71). Rejects $`-2^{w-1}`$ and nonzero padding
 /// bits ([`Error::InvalidEncoding`]).
-fn decode_poly(bytes: &[u8], n: usize, w: u32) -> Result<Zeroizing<Vec<i16>>, Error> {
+fn decode_poly(bytes: &[u8], n: usize, w: u32) -> Result<Secret<Vec<i16>>, Error> {
     debug_assert_eq!(bytes.len(), poly_bytes(n, w));
     let mask = (1u32 << w) - 1;
     let sign = 1u32 << (w - 1);
-    let mut out = Zeroizing::new(Vec::with_capacity(n));
+    let mut out = Secret::new(Vec::with_capacity(n));
     let mut acc = 0u32;
     let mut acc_len = 0u32;
     let mut it = bytes.iter();

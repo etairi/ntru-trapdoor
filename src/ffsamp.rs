@@ -46,7 +46,8 @@
 //! Used by key generation and the tests: [`ExpandedKey::new`],
 //! [`ExpandedKey::params`], [`ExpandedKey::leaf_sigma_range`].
 
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::Zeroize;
+use zeroize::ZeroizeOnDrop;
 
 use crate::fft::{
     GM_LOGN2, fft, flc_mul, merge_sub_mul_add_split, poly_add, poly_ldl_fft, poly_merge_fft,
@@ -64,7 +65,7 @@ const KEY_ID_LABEL: &[u8] = b"ntru-trapdoor/v1/key-id";
 const LEAF_MARGIN: f64 = 1.0 + 1.0 / (1u64 << 40) as f64;
 
 /// A secret key expanded for sampling: FFT basis, ffLDL tree, and a key identifier for the
-/// hedged seed derivation. Read-only after construction (`Send + Sync`); wiped on drop.
+/// hedged seed derivation. Read-only after construction (`Send + Sync`). Wiped on drop.
 pub struct ExpandedKey {
     pub(crate) params: Params,
     /// `[b00 | b01 | b10 | b11]` = FFT of `[g, -f, G, -F]`, `4n` values.
@@ -96,7 +97,9 @@ impl Zeroize for ExpandedKey {
 
 impl Drop for ExpandedKey {
     fn drop(&mut self) {
-        self.zeroize();
+        if crate::wipe::ENABLED {
+            self.zeroize();
+        }
     }
 }
 
@@ -180,7 +183,7 @@ impl ExpandedKey {
             // The tree (the LDL and split steps of fn-dsa's ffsamp_fft_inner).
             let mut tree = vec![0.0f64; tree_size(logn)];
             build_tree(logn, g00, g01, g11, &mut tree, tmp, params.inv_sigma);
-            work.as_mut_slice().zeroize();
+            crate::wipe::slice(&mut work);
 
             // Leaf check.
             let sigma_min = params.sigma_min;
@@ -194,8 +197,8 @@ impl ExpandedKey {
                 vmax = vmax.max(v);
             });
             if !ok || !(vmin > 0.0 && vmax.is_finite()) {
-                tree.as_mut_slice().zeroize();
-                basis.as_mut_slice().zeroize();
+                crate::wipe::slice(&mut tree);
+                crate::wipe::slice(&mut basis);
                 return Err(Error::LeafOutOfRange);
             }
 
@@ -211,7 +214,7 @@ impl ExpandedKey {
                 &[KEY_ID_LABEL, &params.q.to_le_bytes(), &[logn as u8], &enc],
                 &mut key_id,
             );
-            enc.as_mut_slice().zeroize();
+            crate::wipe::slice(&mut enc);
 
             Ok(ExpandedKey {
                 params,

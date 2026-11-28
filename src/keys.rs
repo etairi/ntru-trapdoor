@@ -6,7 +6,8 @@
 use core::fmt;
 use std::sync::OnceLock;
 
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::Zeroize;
+use zeroize::ZeroizeOnDrop;
 
 use crate::poly::wipe_vec;
 use crate::{Error, Params, PreparedRqPoly, RqPoly};
@@ -106,7 +107,9 @@ impl Zeroize for SecretKey {
 
 impl Drop for SecretKey {
     fn drop(&mut self) {
-        self.zeroize();
+        if crate::wipe::ENABLED {
+            self.zeroize();
+        }
     }
 }
 
@@ -114,8 +117,9 @@ impl ZeroizeOnDrop for SecretKey {}
 
 impl SecretKey {
     /// Assembles a secret key from its four polynomials. Checks the parameter set and the
-    /// lengths only; [`SecretKey::validate`] checks $`fG-gF=q`$, the encoding widths and the
+    /// lengths only. [`SecretKey::validate`] checks $`fG-gF=q`$, the encoding widths and the
     /// invertibility of $`f`$, and [`crate::ExpandedKey::new`] runs it before using the key.
+    /// The polynomials are wiped when this returns an error, as when a key is dropped.
     pub fn from_parts(
         params: &Params,
         f: Vec<i16>,
@@ -123,19 +127,21 @@ impl SecretKey {
         big_f: Vec<i16>,
         big_g: Vec<i16>,
     ) -> Result<SecretKey, Error> {
-        params.validate()?;
-        let n = params.n();
-        if f.len() != n || g.len() != n || big_f.len() != n || big_g.len() != n {
-            return Err(Error::InvalidLength);
-        }
-        Ok(SecretKey {
+        // Owned by a key first, so that an early return drops (and wipes) them.
+        let sk = SecretKey {
             params: *params,
             f,
             g,
             big_f,
             big_g,
             validated: false,
-        })
+        };
+        params.validate()?;
+        let n = params.n();
+        if sk.f.len() != n || sk.g.len() != n || sk.big_f.len() != n || sk.big_g.len() != n {
+            return Err(Error::InvalidLength);
+        }
+        Ok(sk)
     }
 
     /// The parameter set.

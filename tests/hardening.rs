@@ -11,6 +11,9 @@
 //!   Verify on `s = 0`;
 //! - H-6 (overstretched-NTRU check, 2026-10-04): `Params::validate` refuses a Gram–Schmidt bound
 //!   above `(1.17 sqrt q)^2`, which would let small `f, g` through at a large `q`.
+//! - H-7 (side channels): the reductions of signed integers modulo `q` without a division equal
+//!   `rem_euclid`, the centred representatives taken by a mask equal the plain ones, and a
+//!   preimage's `Debug` output and equality reveal nothing beyond their result.
 
 use ntru_trapdoor::hazmat::{LeafSampler, Prng, SamplerZ};
 use ntru_trapdoor::{
@@ -352,4 +355,109 @@ fn api_details() {
         s1: vec![0; params.n()],
     };
     assert!(verify(&pk, &zero, &s0, params.beta_sq));
+}
+
+/// H-7: `RqPoly::from_i64`, `from_i32` and `from_i16` reduce like `rem_euclid` over the whole
+/// range of their types, `to_centered` gives the representatives in (-q/2, q/2], and a
+/// preimage prints its degree only and compares equal exactly when its halves are equal.
+#[test]
+fn reductions_and_preimage_details() {
+    for params in [Params::PCS, Params::FALCON_1024] {
+        let n = params.n();
+        let q = params.q as i64;
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let edges = [
+            0i64,
+            1,
+            -1,
+            q,
+            -q,
+            q - 1,
+            1 - q,
+            q + 1,
+            -q - 1,
+            2 * q,
+            -2 * q,
+        ];
+        let mut v64: Vec<i64> = vec![i64::MIN, i64::MAX, i64::MIN + 1, i64::MAX - 1];
+        v64.extend(edges);
+        while v64.len() < n {
+            let r = next();
+            v64.push(r as i64 >> (r % 64));
+        }
+        let want = |v: &[i64]| {
+            v.iter()
+                .map(|&c| c.rem_euclid(q) as u32)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            RqPoly::from_i64(&params, &v64).unwrap().coeffs(),
+            want(&v64)
+        );
+        let mut v32: Vec<i32> = vec![i32::MIN, i32::MAX, i32::MIN + 1];
+        v32.extend(edges.iter().map(|&c| c as i32));
+        while v32.len() < n {
+            let r = next();
+            v32.push(r as i32 >> (r % 32));
+        }
+        let w32: Vec<i64> = v32.iter().map(|&c| c as i64).collect();
+        assert_eq!(
+            RqPoly::from_i32(&params, &v32).unwrap().coeffs(),
+            want(&w32)
+        );
+        let mut v16: Vec<i16> = vec![i16::MIN, i16::MAX, i16::MIN + 1, 0, 1, -1];
+        while v16.len() < n {
+            v16.push(next() as i16);
+        }
+        let w16: Vec<i64> = v16.iter().map(|&c| c as i64).collect();
+        assert_eq!(
+            RqPoly::from_i16(&params, &v16).unwrap().coeffs(),
+            want(&w16)
+        );
+
+        // Every residue below q/2 + 2 and above q/2 - 2, and random ones.
+        let mut c: Vec<u32> = (0..4).chain(q as u32 / 2 - 2..q as u32 / 2 + 3).collect();
+        c.extend((q as u32 - 3)..q as u32);
+        while c.len() < n {
+            c.push((next() % q as u64) as u32);
+        }
+        let a = RqPoly::from_coeffs(&params, &c).unwrap();
+        let plain: Vec<i32> = c
+            .iter()
+            .map(|&x| {
+                let x = x as i64;
+                (if 2 * x > q { x - q } else { x }) as i32
+            })
+            .collect();
+        assert_eq!(a.to_centered(), plain);
+    }
+
+    let n = 1024;
+    let s = Preimage {
+        s0: (0..n as i32).map(|i| i - 512).collect(),
+        s1: (0..n as i32).map(|i| 3 * i - 1000).collect(),
+    };
+    assert_eq!(format!("{s:?}"), "Preimage { n: 1024, .. }");
+    assert_eq!(s, s.clone());
+    for (half, i) in [(0, 0), (0, n - 1), (1, 0), (1, n / 2), (1, n - 1)] {
+        for delta in [1, -1, i32::MIN] {
+            let mut t = s.clone();
+            let v = if half == 0 {
+                &mut t.s0[i]
+            } else {
+                &mut t.s1[i]
+            };
+            *v = v.wrapping_add(delta);
+            assert_ne!(s, t, "half {half}, index {i}, delta {delta}");
+        }
+    }
+    let mut short = s.clone();
+    short.s1.pop();
+    assert_ne!(s, short);
 }

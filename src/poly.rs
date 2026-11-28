@@ -5,8 +5,10 @@
 
 use core::fmt;
 
-use zeroize::{DefaultIsZeroes, Zeroize, ZeroizeOnDrop};
+use zeroize::ZeroizeOnDrop;
+use zeroize::{DefaultIsZeroes, Zeroize};
 
+use crate::ring::ntt::ModQ;
 use crate::{Error, Params};
 
 /// Wipes the elements and the spare capacity of `v` (each byte once, volatile), then
@@ -83,15 +85,19 @@ impl RqPoly {
 
     /// From arbitrary integers, reduced modulo $`q`$; `c.len()` must be $`d`$. Errors:
     /// [`Error::InvalidParams`], [`Error::InvalidLength`].
+    ///
+    /// The reduction of [`RqPoly::from_i64`], [`RqPoly::from_i32`] and [`RqPoly::from_i16`] is
+    /// a Barrett reduction with masks, without a division, whose time does not depend on the
+    /// integers (they may be secret, as the halves of a [`Preimage`] or the trapdoor are).
     pub fn from_i64(params: &Params, c: &[i64]) -> Result<RqPoly, Error> {
         params.check_ring()?;
         if c.len() != params.n() {
             return Err(Error::InvalidLength);
         }
-        let q = params.q as i64;
+        let mq = ModQ::new(params.q);
         Ok(RqPoly {
             q: params.q,
-            c: c.iter().map(|&x| x.rem_euclid(q) as u32).collect(),
+            c: c.iter().map(|&x| mq.reduce_i64(x)).collect(),
         })
     }
 
@@ -102,10 +108,10 @@ impl RqPoly {
         if c.len() != params.n() {
             return Err(Error::InvalidLength);
         }
-        let q = params.q as i64;
+        let mq = ModQ::new(params.q);
         Ok(RqPoly {
             q: params.q,
-            c: c.iter().map(|&x| (x as i64).rem_euclid(q) as u32).collect(),
+            c: c.iter().map(|&x| mq.reduce_i32(x)).collect(),
         })
     }
 
@@ -116,10 +122,10 @@ impl RqPoly {
         if c.len() != params.n() {
             return Err(Error::InvalidLength);
         }
-        let q = params.q as i64;
+        let mq = ModQ::new(params.q);
         Ok(RqPoly {
             q: params.q,
-            c: c.iter().map(|&x| (x as i64).rem_euclid(q) as u32).collect(),
+            c: c.iter().map(|&x| mq.reduce_i32(i32::from(x))).collect(),
         })
     }
 
@@ -145,14 +151,16 @@ impl RqPoly {
         &self.c
     }
 
-    /// The centred representatives, in $`(-q/2,q/2]`$.
+    /// The centred representatives, in $`(-q/2,q/2]`$, selected by a mask.
     pub fn to_centered(&self) -> Vec<i32> {
         let q = self.q as i64;
         self.c
             .iter()
             .map(|&x| {
                 let x = x as i64;
-                (if 2 * x > q { x - q } else { x }) as i32
+                // All ones iff 2x > q, that is, iff x is above q/2.
+                let above = (q - 2 * x) >> 63;
+                (x - (q & above)) as i32
             })
             .collect()
     }
@@ -228,8 +236,10 @@ impl fmt::Debug for PreparedRqPoly {
 /// ($`A=[1\mid h]`$), as signed integer coefficients.
 ///
 /// In the PCS the preimage is the credential holder's secret witness, so it is wiped on drop
-/// (elements and spare capacity, one volatile pass).
-#[derive(Clone, PartialEq, Eq)]
+/// (elements and spare capacity, one volatile pass). Equality compares every coefficient,
+/// without an early exit.
+/// `Debug` prints the degree only.
+#[derive(Clone)]
 pub struct Preimage {
     /// $`s_0`$, the coefficient vector multiplying $`1`$.
     pub s0: Vec<i32>,
@@ -247,11 +257,30 @@ impl Zeroize for Preimage {
 
 impl Drop for Preimage {
     fn drop(&mut self) {
-        self.zeroize();
+        if crate::wipe::ENABLED {
+            self.zeroize();
+        }
     }
 }
 
 impl ZeroizeOnDrop for Preimage {}
+
+impl PartialEq for Preimage {
+    /// Equal halves, in a time that depends on the lengths only: every pair of coefficients
+    /// enters one difference, read once at the end.
+    fn eq(&self, other: &Preimage) -> bool {
+        if self.s0.len() != other.s0.len() || self.s1.len() != other.s1.len() {
+            return false;
+        }
+        let pairs = self.s0.iter().zip(&other.s0);
+        let diff = pairs
+            .chain(self.s1.iter().zip(&other.s1))
+            .fold(0i32, |acc, (a, b)| acc | (a ^ b));
+        core::hint::black_box(diff) == 0
+    }
+}
+
+impl Eq for Preimage {}
 
 impl Preimage {
     /// $`\|s\|^2=\|s_0\|^2+\|s_1\|^2`$, saturating at `u64::MAX`.
@@ -275,12 +304,8 @@ impl Preimage {
 }
 
 impl fmt::Debug for Preimage {
+    /// The degree only: the norm, like the coefficients, depends on the secret preimage.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "Preimage {{ n: {}, norm_sq: {}, .. }}",
-            self.s0.len(),
-            self.norm_sq()
-        )
+        write!(f, "Preimage {{ n: {}, .. }}", self.s0.len())
     }
 }

@@ -55,11 +55,12 @@ jobs:
   branches:
     # The compiled base sampler does not branch on the draw: tools/sampler_branches.py reads
     # the optimized LLVM IR, default build and simd, with both toolchains (another LLVM may
-    # compile the same source differently).
+    # compile the same source differently). On x86-64 it also reads the machine code for calls
+    # of the C library's floor and rounding functions in SampPre.
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm]
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
         toolchain: ['1.95.0', stable]
     runs-on: ${{ matrix.os }}
     steps:

@@ -39,8 +39,6 @@
 //!
 //! All arithmetic is branch-free (masks), as in fn-dsa. Temporary residues are wiped.
 
-use zeroize::Zeroize;
-
 /// One NTT prime with its Montgomery constants (fn-dsa-kgen `SmallPrime`, mp31.rs:276-287).
 pub(crate) struct NttPrime {
     /// The modulus, $`1.34\cdot2^{30}<p<2^{31}`$, $`p\equiv1\pmod{2048}`$.
@@ -396,10 +394,22 @@ impl ModQ {
         (r & !neg) | (nr & neg)
     }
 
-    /// $`x \bmod q`$ for $`x<2^{63}`$.
+    /// $`x \bmod q`$ for a signed `x`, in $`[0,q)`$, without a division. The magnitude is at
+    /// most $`2^{63}`$, within the range of [`ModQ::reduce`].
+    #[inline(always)]
+    pub(crate) fn reduce_i64(&self, x: i64) -> u32 {
+        let r = self.reduce(x.unsigned_abs());
+        // For x < 0: (q - r) mod q, selected by a mask.
+        let neg = (x >> 63) as u32;
+        let nr = mp_sub(0, r, self.q as u32);
+        (r & !neg) | (nr & neg)
+    }
+
+    /// $`x \bmod q`$ for any $`x<2^{64}`$.
     #[inline(always)]
     pub(crate) fn reduce(&self, x: u64) -> u32 {
-        // qhat in {floor(x/q) - 1, floor(x/q)}, so r in [0, 2q).
+        // qhat in {floor(x/q) - 1, floor(x/q)}, so r in [0, 2q): with m = floor((2^64 - 1)/q)
+        // >= (2^64 - q)/q, x m / 2^64 >= x/q - x/2^64 > x/q - 1, and x m / 2^64 < x/q.
         let qhat = ((x as u128 * self.m as u128) >> 64) as u64;
         let r = x - qhat * self.q;
         let r2 = r.wrapping_sub(self.q);
@@ -511,7 +521,7 @@ pub(crate) fn mul_prepared_mod_q(
     // wipes: `Vec::zeroize` would also wipe the capacity byte by byte, about ten times the cost
     // [measured, sign/README.md]).
     for v in [&mut b1, &mut b2] {
-        v.as_mut_slice().zeroize();
+        crate::wipe::slice(v);
     }
 }
 
@@ -521,7 +531,7 @@ pub(crate) fn mul_mod_q(logn: u32, q: u32, a: &[u32], b: &[u32], out: &mut [u32]
     let (mut a1, mut a2) = prepare(logn, a);
     mul_prepared_mod_q(logn, q, &a1, &a2, b, out);
     for v in [&mut a1, &mut a2] {
-        v.as_mut_slice().zeroize();
+        crate::wipe::slice(v);
     }
 }
 
@@ -587,7 +597,7 @@ pub(crate) fn sum_of_prepared_products_mod_q(
         }
     }
     for v in [&mut acc1, &mut acc2, &mut b1, &mut b2] {
-        v.as_mut_slice().zeroize();
+        crate::wipe::slice(v);
     }
 }
 
@@ -638,7 +648,7 @@ pub(crate) fn centred_p1_from_prepared(logn: u32, q: u32, r1: &[u32]) -> Vec<u32
     }
     P1.intt_n(logn, &mut a);
     let r = prepare_centred_p1(logn, q, &a);
-    a.as_mut_slice().zeroize();
+    crate::wipe::slice(&mut a);
     r
 }
 
@@ -685,7 +695,7 @@ pub(crate) fn mul_ternary_p1_mod_q(logn: u32, q: u32, ac1: &[u32], t: &[u32], ou
             *o = mq.reduce_i32(c);
         }
     }
-    b.as_mut_slice().zeroize();
+    crate::wipe::slice(&mut b);
 }
 
 /// `true` iff $`fG-gF=q`$ in $`\mathbb Z[x]/(x^n+1)`$, exactly, for $`n=2^{\mathrm{logn}}`$ and
@@ -737,7 +747,7 @@ pub(crate) fn ntru_equation_holds(
             diff |= lhs ^ q;
         }
     }
-    buf.as_mut_slice().zeroize();
+    crate::wipe::slice(&mut buf);
     diff == 0
 }
 
@@ -869,6 +879,46 @@ mod tests {
                     "q {q} v {v}"
                 );
             }
+        }
+    }
+
+    /// `reduce_i64` is `rem_euclid` on the whole range of `i64`, its ends included (the
+    /// magnitude of `i64::MIN` is 2^63), and `reduce` on the whole range of `u64`.
+    #[test]
+    fn reduce_signed_i64() {
+        for q in [3u32, 17, 12289, 1048573, (1 << 25) - 39] {
+            let mq = ModQ::new(q);
+            let qi = q as i64;
+            let mut vals = vec![
+                0i64,
+                1,
+                -1,
+                i64::MAX,
+                i64::MIN,
+                i64::MIN + 1,
+                i64::MAX - 1,
+                qi,
+                -qi,
+                qi - 1,
+                1 - qi,
+                i64::MIN / qi * qi,
+                i64::MAX / qi * qi,
+            ];
+            let mut x: u64 = 0x0fed_cba9_8765_4321;
+            for _ in 0..10000 {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                vals.push(x as i64);
+                vals.push((x as i64) >> 20);
+                vals.push((x as i64) >> 40);
+            }
+            for &v in &vals {
+                assert_eq!(mq.reduce_i64(v) as i64, v.rem_euclid(qi), "q {q} v {v}");
+                let u = v as u64;
+                assert_eq!(mq.reduce(u) as u64, u % q as u64, "q {q} u {u}");
+            }
+            assert_eq!(mq.reduce(u64::MAX) as u64, u64::MAX % q as u64);
         }
     }
 

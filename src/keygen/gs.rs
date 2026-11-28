@@ -15,7 +15,6 @@
 //!   $`|\hat f_j|\approx10^3`$, and a 512-term sum]; only keys within that distance of the bound
 //!   can be misclassified, and the leaf check of TrapGen protects the sampler regardless.
 
-use crate::poly::wipe_vec;
 use crate::{Params, fft};
 
 /// $`N_1=\|f\|^2+\|g\|^2`$, exactly.
@@ -47,9 +46,9 @@ pub(crate) fn ortho_sq_norm(params: &Params, f: &[i16], g: &[i16]) -> f64 {
     let q = params.q as f64;
     let n2 = (2.0 * q * q / n as f64) * s;
     // Slice wipes (`crate::poly::wipe_vec`): `Vec::zeroize` costs about ten times more.
-    wipe_vec(&mut fx);
-    wipe_vec(&mut gx);
-    wipe_vec(&mut d);
+    crate::wipe::vec(&mut fx);
+    crate::wipe::vec(&mut gx);
+    crate::wipe::vec(&mut d);
     n2
 }
 

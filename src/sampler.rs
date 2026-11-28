@@ -157,10 +157,12 @@ impl<'a, P: Prng> SamplerZ<'a, P> {
     }
 }
 
-/// Whether the portable code rounds to an integer in one instruction (`frintm`, `frintz` on
-/// aarch64). On x86-64 without SSE4.1 `floor` and `trunc` are library calls, and the conversions
-/// to an integer and back are faster.
-const NATIVE_ROUND: bool = cfg!(target_arch = "aarch64");
+/// Whether the portable code rounds to an integer in one instruction (`frintm`, `frintz`,
+/// `frintn` on aarch64). On x86-64 without SSE4.1 `floor`, `trunc` and `round_ties_even` are
+/// calls into the C library, whose time depends on its implementation (a portable one branches
+/// on the exponent of the value), so the code without `ROUND` takes integer parts through
+/// conversions to an integer and back ([`floor_i64`], [`rint`]).
+pub(crate) const NATIVE_ROUND: bool = cfg!(target_arch = "aarch64");
 
 impl<P: Prng> LeafSampler for SamplerZ<'_, P> {
     #[inline]
@@ -177,18 +179,49 @@ impl<P: Prng> LeafSampler for SamplerZ<'_, P> {
 /// `mu - floor(mu)` instead, one conversion shorter: the same value whenever
 /// `|floor(mu)| < 2^62` (the integer is then exact both ways), except for `mu = -0.0`, where it
 /// is `+0.0` against fn-dsa's `-0.0`, which no difference `z - r` of the sampler distinguishes
-/// (test `centre_forms_agree`). Larger centres take fn-dsa's form.
+/// (test `centre_forms_agree`). Larger centres take fn-dsa's form. Without `ROUND` the floor is
+/// [`floor_i64`], the same integer as `mu.floor() as i64` without a library call.
 #[inline(always)]
 fn centre<const ROUND: bool>(mu: f64) -> (i32, f64) {
-    let fl = mu.floor();
     if ROUND {
+        let fl = mu.floor();
         if fl.abs() >= 4_611_686_018_427_387_904.0 {
             return centre_far(mu);
         }
         return (fl as i64 as i32, mu - fl);
     }
-    let s = fl as i64;
+    let s = floor_i64(mu);
     (s as i32, mu - s as f64)
+}
+
+/// `x.floor() as i64` (saturated, and 0 for NaN, as the cast does) for every `x`, without a
+/// library call or a branch: the conversion truncates, and one is subtracted where truncation
+/// went up (fn-dsa's `FLR::floor`, flr_native.rs:437-480). The comparison is exact: below
+/// $`2^{52}`$ the truncated integer converts back exactly, and from $`2^{52}`$ on `x` is an
+/// integer itself. The subtraction saturates for `x` below $`-2^{63}`$ (test
+/// `floor_i64_equals_floor`).
+#[inline(always)]
+pub(crate) fn floor_i64(x: f64) -> i64 {
+    let t = x as i64;
+    t.saturating_sub((x < t as f64) as i64)
+}
+
+/// `x.round_ties_even()` for every `x`, without a library call or a branch: below $`2^{52}`$
+/// in magnitude, adding and subtracting $`2^{52}`$ rounds to an integer with ties to even (the
+/// sum lies in $`[2^{52},2^{53}]`$, where the spacing of `f64` is 1), and from $`2^{52}`$ on
+/// (or for NaN) the value is kept. The sign is copied back, so that `-0.3` gives `-0.0`, as
+/// `round_ties_even` does (test `rint_equals_round_ties_even`). With `ROUND` it is
+/// `round_ties_even` itself, one instruction.
+#[inline(always)]
+pub(crate) fn rint<const ROUND: bool>(x: f64) -> f64 {
+    if ROUND {
+        return x.round_ties_even();
+    }
+    const TWO_P52: f64 = 4_503_599_627_370_496.0;
+    let a = x.abs();
+    let r = (a + TWO_P52) - TWO_P52;
+    let r = if a < TWO_P52 { r } else { a };
+    r.copysign(x)
 }
 
 /// [`centre`] for `|floor(mu)| >= 2^62` (or NaN): fn-dsa's form.
@@ -472,15 +505,18 @@ fn ber_exp_shortcut<P: Prng, const ROUND: bool>(prng: &mut P, x: f64, ccs: f64) 
     };
     let r = x - sf * LOG2;
     // f ~ ccs e^-r 2^(8 - s) = z / 2^56, within 6.2e-4 for 0 <= s <= 7. For s >= 8 the
-    // threshold's top byte is 0 (s >= 64: the threshold is 0), and f = 0 gives m = 0.
-    let f = if s < 8 {
-        let u = r - R0;
-        let u2 = u * u;
-        let p = (1.0 - u) + u2 * ((0.5 - u * (1.0 / 6.0)) + u2 * (1.0 / 24.0 - u * (1.0 / 120.0)));
-        (ccs * f64::from_bits((1023 - s as u64) << 52)) * (E0 * p)
-    } else {
-        0.0
-    };
+    // threshold's top byte is 0 (s >= 64: the threshold is 0), and f = 0 gives m = 0. s depends
+    // on the centre, so no branch may: the estimate is computed for every s, with the exponent
+    // s mod 8 so that its power of two stays a normal number (s itself for s <= 7), then
+    // replaced by 0 where s >= 8, through the comparison xs < 8, which equals s < 8 (s is the
+    // truncation of xs >= 0). On x86-64 rustc 1.100.0 compiles that comparison to cmpltsd and
+    // andpd, whereas the clamp min(s, 8) and the test of s < 8 each became a branch.
+    let u = r - R0;
+    let u2 = u * u;
+    let p = (1.0 - u) + u2 * ((0.5 - u * (1.0 / 6.0)) + u2 * (1.0 / 24.0 - u * (1.0 / 120.0)));
+    let scale = f64::from_bits((1023 - (s & 7) as u64) << 52);
+    let estimate = (ccs * scale) * (E0 * p);
+    let f = if xs < 8.0 { estimate } else { 0.0 };
     let w0 = prng.next_u8();
     let (accept, reject) = first_byte_decision(f, w0);
     if accept {
@@ -1075,6 +1111,70 @@ mod tests {
             for z in -45..=45i32 {
                 let (ta, tb) = (z as f64 - ra, z as f64 - rb);
                 assert!(ta.to_bits() == tb.to_bits() || (ta.is_nan() && tb.is_nan()));
+            }
+        }
+    }
+
+    /// Values at the edges of the floor and of the rounding (integers, halves and their
+    /// neighbours, the powers of two where the spacing of `f64` reaches 1 and 2, the ends of the
+    /// range of `i64`, zeros of both signs, subnormals, infinities and NaN), and random bit
+    /// patterns, which cover every exponent and both signs.
+    fn rounding_edges() -> Vec<f64> {
+        let mut xs = vec![
+            0.0,
+            -0.0,
+            5e-324,
+            -5e-324,
+            f64::MIN_POSITIVE,
+            f64::MAX,
+            f64::MIN,
+        ];
+        xs.extend([f64::INFINITY, f64::NEG_INFINITY, f64::NAN]);
+        let mut ks: Vec<f64> = (0..=12).map(|i| i as f64 * 0.5).collect();
+        for e in [20, 51, 52, 53, 62, 63, 64, 100] {
+            let p = 2f64.powi(e);
+            ks.extend([p, p - 1.0, p - 0.5, p + 0.5, p + 1.0]);
+        }
+        for k in ks {
+            for v in [k, -k] {
+                xs.extend([v, v.next_down(), v.next_up()]);
+            }
+        }
+        let mut rng = Shake256Prng::new(b"rounding-edges");
+        for _ in 0..200_000 {
+            xs.push(f64::from_bits(rng.next_u64()));
+            let e = (rng.next_u8() % 80) as i32 - 10;
+            let u = (rng.next_u64() >> 11) as f64 / (1u64 << 53) as f64 - 0.5;
+            xs.push(u * 2f64.powi(e));
+        }
+        xs
+    }
+
+    /// `floor_i64(x)` is `x.floor() as i64` for every `x` (saturated, NaN to 0).
+    #[test]
+    fn floor_i64_equals_floor() {
+        for x in rounding_edges() {
+            assert_eq!(
+                floor_i64(x),
+                x.floor() as i64,
+                "x {x:e} ({:#x})",
+                x.to_bits()
+            );
+        }
+    }
+
+    /// `rint::<false>(x)` is `x.round_ties_even()` bit for bit, signed zeros included, for every
+    /// `x` but NaN, which stays NaN, and so is `rint::<true>`.
+    #[test]
+    fn rint_equals_round_ties_even() {
+        for x in rounding_edges() {
+            let want = x.round_ties_even();
+            for got in [rint::<false>(x), rint::<true>(x)] {
+                assert!(
+                    got.to_bits() == want.to_bits() || (got.is_nan() && want.is_nan()),
+                    "x {x:e} ({:#x}): {got:e} against {want:e}",
+                    x.to_bits()
+                );
             }
         }
     }

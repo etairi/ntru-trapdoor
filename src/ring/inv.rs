@@ -20,8 +20,6 @@
 //! depend on the value of $`a`$; only the final `None`/`Some` reveals whether $`a`$ is a unit.
 //! Intermediate buffers are wiped.
 
-use zeroize::Zeroize;
-
 use super::ntt::{ModQ, NttPrime, P1, P2, mp_add, mp_sub};
 
 /// The NTTs of $`a_e`$ and $`a_o`$ at one level, modulo both primes. Wiped on drop (the element
@@ -40,7 +38,7 @@ impl Drop for Level {
         // Slice wipes: `Vec::zeroize` would also wipe the whole capacity byte by byte, about
         // ten times the cost [measured, sign/README.md].
         for v in [&mut self.e1, &mut self.o1, &mut self.e2, &mut self.o2] {
-            v.as_mut_slice().zeroize();
+            crate::wipe::slice(v);
         }
     }
 }
@@ -93,8 +91,8 @@ fn descend(mq: &ModQ, logh: u32, a: &[u32]) -> (Vec<u32>, Level) {
     P1.intt_n(logh, &mut n1);
     P2.intt_n(logh, &mut n2);
     let norm = crt_vec(mq, &n1, &n2);
-    n1.as_mut_slice().zeroize();
-    n2.as_mut_slice().zeroize();
+    crate::wipe::slice(&mut n1);
+    crate::wipe::slice(&mut n2);
     (
         norm,
         Level {
@@ -173,7 +171,7 @@ fn descend_all(logn: u32, q: u32, a: &[u32], keep: bool) -> (u32, [u32; 2], Vec<
     let mut lg = logn;
     while lg > 1 {
         let (norm, level) = descend(&mq, lg - 1, &cur);
-        cur.as_mut_slice().zeroize();
+        crate::wipe::slice(&mut cur);
         cur = norm;
         if keep {
             levels.push(level);
@@ -182,7 +180,7 @@ fn descend_all(logn: u32, q: u32, a: &[u32], keep: bool) -> (u32, [u32; 2], Vec<
     }
     // Size 2: a0 + a1 x modulo x^2 + 1; the norm is a0^2 + a1^2.
     let (a0, a1) = (cur[0], cur[1]);
-    cur.as_mut_slice().zeroize();
+    crate::wipe::slice(&mut cur);
     let nrm = mq.reduce(a0 as u64 * a0 as u64 + a1 as u64 * a1 as u64);
     (nrm, [a0, a1], levels)
 }
@@ -249,7 +247,7 @@ pub(crate) fn invert(logn: u32, q: u32, a: &[u32]) -> Option<Vec<u32>> {
             }
         }
         for v in [&mut i1, &mut i2, &mut pe1, &mut po1, &mut pe2, &mut po2] {
-            v.as_mut_slice().zeroize();
+            crate::wipe::slice(v);
         }
         inv = out;
     }

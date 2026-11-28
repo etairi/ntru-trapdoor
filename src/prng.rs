@@ -15,7 +15,7 @@
 //! Used across the crate and by the tests: [`Prng`], [`Shake256Prng::new`],
 //! [`Shake256Prng::from_parts`], [`shake256`].
 
-use zeroize::Zeroize;
+use crate::wipe;
 
 /// A deterministic byte source; [`Shake256Prng`] is the production implementation.
 ///
@@ -491,7 +491,7 @@ macro_rules! keccak_f1600_body {
 
 
     *$state = A;
-    A.zeroize();
+    crate::wipe::slice(&mut A);
     }};
 }
 
@@ -718,7 +718,7 @@ impl Shake256 {
 
 impl Drop for Shake256 {
     fn drop(&mut self) {
-        self.state.zeroize();
+        wipe::slice(&mut self.state);
     }
 }
 
@@ -876,9 +876,9 @@ impl Prng for Shake256Prng {
 
 impl Drop for Shake256Prng {
     fn drop(&mut self) {
-        self.state.zeroize();
-        self.buf.zeroize();
-        self.pre.as_mut_slice().zeroize();
+        wipe::slice(&mut self.state);
+        wipe::slice(&mut self.buf);
+        wipe::slice(&mut self.pre);
         self.ptr = RATE;
     }
 }
@@ -1012,39 +1012,49 @@ fn shake256_many(msgs: &[&[u8]], blocks: usize) -> (Vec<[u64; 25]>, Vec<Vec<u8>>
 }
 
 /// [`shake256`] of several inputs of the same length at once, `N` bytes of output each
-/// (`N <= 136`), with the multi-state kernels.
-pub(crate) fn shake256_parallel<const N: usize>(msgs: &[&[u8]]) -> Vec<[u8; N]> {
+/// (`N <= 136`) into `out`, one entry per input, with the multi-state kernels. The outputs go
+/// straight into the caller's buffer, which keeps them until it wipes them, and the states and
+/// the squeezed blocks are wiped. Panics if the counts differ.
+pub(crate) fn shake256_parallel<const N: usize>(msgs: &[&[u8]], out: &mut [[u8; N]]) {
     const { assert!(N <= RATE) };
+    assert_eq!(
+        msgs.len(),
+        out.len(),
+        "shake256_parallel: one output per input"
+    );
     let (mut states, mut blocks) = shake256_many(msgs, 1);
-    let out = blocks
-        .iter()
-        .map(|b| core::array::from_fn(|i| b[i]))
-        .collect();
+    for (o, b) in out.iter_mut().zip(blocks.iter()) {
+        o.copy_from_slice(&b[..N]);
+    }
     for st in states.iter_mut() {
-        st.zeroize();
+        wipe::slice(st);
     }
     for b in blocks.iter_mut() {
-        b.as_mut_slice().zeroize();
+        wipe::slice(b);
     }
-    out
 }
 
 /// The streams SHAKE256(`seeds[i]`) (seeds of the same length), with their first `blocks`
 /// blocks squeezed together by the multi-state kernels: each PRNG returns the bytes of
-/// `Shake256Prng::new(seeds[i])`, the first ones from the blocks squeezed ahead.
+/// `Shake256Prng::new(seeds[i])`, the first ones from the blocks squeezed ahead. The states are
+/// copied into the PRNGs, which wipe them on drop, and their vector is wiped.
 pub(crate) fn squeeze_streams(seeds: &[&[u8]], blocks: usize) -> Vec<Shake256Prng> {
-    let (states, pre) = shake256_many(seeds, blocks);
-    states
-        .into_iter()
+    let (mut states, pre) = shake256_many(seeds, blocks);
+    let prngs = states
+        .iter()
         .zip(pre)
-        .map(|(state, pre)| Shake256Prng {
+        .map(|(&state, pre)| Shake256Prng {
             state,
             buf: [0u8; RATE],
             ptr: RATE,
             pre,
             pre_at: 0,
         })
-        .collect()
+        .collect();
+    for st in states.iter_mut() {
+        wipe::slice(st);
+    }
+    prngs
 }
 
 /// SHAKE256 of the concatenation of `parts`, `out.len()` bytes of output.
@@ -1060,6 +1070,7 @@ pub fn shake256(parts: &[&[u8]], out: &mut [u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zeroize::Zeroize;
 
     /// The textbook permutation equals the lane-complementing one: on the zero state, the
     /// all-ones state, every single-bit state and random states (aarch64 runs the first, other
@@ -1267,7 +1278,8 @@ mod tests {
                     .map(|_| (0..len).map(|_| rng.next_u8()).collect())
                     .collect();
                 let refs: Vec<&[u8]> = msgs.iter().map(|m| m.as_slice()).collect();
-                let got = shake256_parallel::<64>(&refs);
+                let mut got = vec![[0u8; 64]; count];
+                shake256_parallel::<64>(&refs, &mut got);
                 for (m, g) in msgs.iter().zip(got.iter()) {
                     let mut want = [0u8; 64];
                     shake256(&[m], &mut want);

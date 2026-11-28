@@ -4,6 +4,37 @@ All notable changes to this crate. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the crate follows
 [Semantic Versioning](https://semver.org/).
 
+## [0.1.4] - 2026-11-27
+
+Side-channel and wiping fixes, with the same outputs. For the same inputs and seeds, every key,
+preimage, product and encoding is the same bytes as in 0.1.3, with and without `simd`. The
+known-answer tests and the fn-dsa parity tests pass unchanged on aarch64 and x86-64, so the seed
+label stays `ntru-trapdoor/v1/samp-pre`.
+
+### Fixed
+
+- SampPre no longer calls the C library to round. On x86-64 without SSE4.1, the floor of every
+  ffSampling centre and the rounding of the lattice point to integers compiled to calls of
+  `floor` and `rint`, whose time depends on the library (a portable one branches on the
+  exponent of the value). Both now go through conversions to an integer and back, as fn-dsa's
+  portable code does. `tools/sampler_branches.py` now also reads the x86-64 machine code and fails
+  on such a call in SampPre's functions, and CI runs it on macOS as well.
+- The first-byte shortcut of the Bernoulli test no longer branches on the trial's exponent
+  `s < 8`, which depends on the centre. The estimate is computed for every trial and masked.
+- `RqPoly::from_i64`, `from_i32` and `from_i16` reduce modulo `q` by a Barrett reduction with
+  masks instead of a division, whose time depends on its operands on many processors. They take
+  the secret trapdoor in key generation and, in consumers, the halves of preimages.
+  `RqPoly::to_centered` selects by a mask.
+- `samp_pre_batch` wipes the vector of Keccak states from which it starts the PRNGs of a group,
+  and derives the seeds of a group straight into a buffer that it wipes, where it left copies of
+  both in freed memory.
+- `SecretKey::from_parts` wipes its polynomials when it returns an error.
+
+### Changed
+
+- Two `Preimage`s compare without an early exit, in a time that depends on their lengths only.
+- `Preimage`'s `Debug` output no longer shows the norm.
+
 ## [0.1.3] - 2026-11-19
 
 Faster, with the same outputs, and a side-channel fix. For the same inputs and seeds, every key,

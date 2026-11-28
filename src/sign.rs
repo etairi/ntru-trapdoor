@@ -46,13 +46,12 @@
 //!
 //! Scratch buffers are allocated per call and wiped before they are released.
 
-use zeroize::{Zeroize, Zeroizing};
-
 use crate::ffsamp::ffsampling;
 use crate::fft::{fft, ifft, poly_lattice_point_fft, poly_target_fft};
 use crate::prng::{Prng, Shake256Prng, shake256};
 use crate::ring::ntt::{self, ModQ};
-use crate::sampler::{LeafSampler, SamplerZ};
+use crate::sampler::{LeafSampler, NATIVE_ROUND, SamplerZ, rint};
+use crate::wipe::{self, Secret};
 use crate::{Error, ExpandedKey, Preimage, PublicKey, RqPoly};
 
 /// Domain-separation label of the per-call seed (design.md §5.1). Bump the version whenever
@@ -79,7 +78,7 @@ pub fn samp_pre(ek: &ExpandedKey, t: &RqPoly, seed: &[u8; 32]) -> Result<Preimag
     if !t.matches(&ek.params) {
         return Err(Error::Mismatch);
     }
-    let mut seed_star = Zeroizing::new([0u8; 64]);
+    let mut seed_star = Secret::new([0u8; 64]);
     shake256(
         &[SAMP_PRE_LABEL, &ek.key_id, &t.to_bytes(), seed],
         &mut seed_star[..],
@@ -160,13 +159,12 @@ fn samp_pre_group(
         .map(|(t, seed)| [SAMP_PRE_LABEL, &ek.key_id, &t.to_bytes(), &seed[..]].concat())
         .collect();
     let refs: Vec<&[u8]> = msgs.iter().map(|m| m.as_slice()).collect();
-    let mut seeds: Vec<Zeroizing<[u8; 64]>> = crate::prng::shake256_parallel::<64>(&refs)
-        .into_iter()
-        .map(Zeroizing::new)
-        .collect();
+    // The seeds go straight into a buffer wiped on drop.
+    let mut seeds = Secret::new(vec![[0u8; 64]; group.len()]);
+    crate::prng::shake256_parallel(&refs, &mut seeds);
     drop(refs);
     for m in msgs.iter_mut() {
-        m.as_mut_slice().zeroize();
+        wipe::slice(m);
     }
     // The streams of attempt 0, `Shake256Prng::from_parts(&[seed*, &[0]])`.
     let mut inputs: Vec<[u8; 65]> = seeds
@@ -176,10 +174,12 @@ fn samp_pre_group(
     let refs: Vec<&[u8]> = inputs.iter().map(|m| m.as_slice()).collect();
     let prngs = crate::prng::squeeze_streams(&refs, presqueeze_blocks(&ek.params));
     drop(refs);
-    inputs.iter_mut().for_each(|x| x.zeroize());
+    for x in inputs.iter_mut() {
+        wipe::slice(x);
+    }
     group
         .iter()
-        .zip(seeds.iter_mut())
+        .zip(seeds.iter())
         .zip(prngs)
         .map(|((&(t, _), seed_star), mut prng)| {
             if let Some(s) = samp_pre_attempt(ek, t, &mut prng) {
@@ -204,7 +204,10 @@ fn samp_pre_group(
 /// trial (one Bernoulli byte per trial), plus one. At the presets, 215 and 285 against 214.3 and
 /// 283.5 read on average (400 attempts each, standard deviations 2.8 and 3.9). Any value gives
 /// the same outputs: blocks squeezed ahead and not read are dropped, and an attempt that reads
-/// more squeezes the next ones itself.
+/// more squeezes the next ones itself. Not inlined: its rounding up takes a call into the C
+/// library on x86-64 without SSE4.1, on public values, and `tools/sampler_branches.py` refuses
+/// such calls in the functions of SampPre.
+#[inline(never)]
 fn presqueeze_blocks(params: &crate::Params) -> usize {
     let acceptance = match params.base {
         crate::params::BaseSampler::HalfGauss3_1 => 0.633687,
@@ -241,7 +244,7 @@ macro_rules! samp_pre_with_fn {
     (
         $(#[$m:meta])*
         $vis:vis fn $name:ident;
-        $fft:path, $target:path, $ffsampling:path, $point:path, $ifft:path
+        $fft:path, $target:path, $ffsampling:path, $point:path, $ifft:path, $round:expr
     ) => {
         $(#[$m])*
         $vis fn $name<S: LeafSampler>(
@@ -276,17 +279,18 @@ macro_rules! samp_pre_with_fn {
             $ifft(logn, t1);
 
             // s0 = t - rint(v0), s1 = -rint(v1) (lib.rs:691-722). FLR::rint is round-half-even
-            // (aarch64 vcvtnd, x86-64 cvtsd2si; flr_native.rs:373-435); the casts saturate, and
-            // out-of-range values (which cannot occur for a valid key) saturate in i32 so that the
-            // norm check rejects them. The guard flags a coordinate farther than 2^-10 from an integer
-            // (or NaN).
+            // (aarch64 vcvtnd, x86-64 cvtsd2si, flr_native.rs:373-435), and so is `rint`, which
+            // takes no library call where rounding has no instruction (the lattice point depends
+            // on the key and the samples). The casts saturate, and out-of-range values (which
+            // cannot occur for a valid key) saturate in i32 so that the norm check rejects them.
+            // The guard flags a coordinate farther than 2^-10 from an integer (or NaN).
             let sat = |x: i64| x.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
             let mut off = false;
             let s0: Vec<i32> = t0
                 .iter()
                 .zip(t.c.iter())
                 .map(|(&v, &c)| {
-                    let r = v.round_ties_even();
+                    let r = rint::<{ $round }>(v);
                     let d = (v - r).abs();
                     off |= (d > ROUND_GUARD) | d.is_nan();
                     sat((c as i64).saturating_sub(r as i64))
@@ -295,15 +299,15 @@ macro_rules! samp_pre_with_fn {
             let s1: Vec<i32> = t1
                 .iter()
                 .map(|&v| {
-                    let r = v.round_ties_even();
+                    let r = rint::<{ $round }>(v);
                     let d = (v - r).abs();
                     off |= (d > ROUND_GUARD) | d.is_nan();
                     sat(0i64.saturating_sub(r as i64))
                 })
                 .collect();
-            // A slice wipe (one volatile pass); `Vec::zeroize` would also wipe the capacity byte by byte,
-            // about 9 us here [measured, sign/README.md].
-            buf.as_mut_slice().zeroize();
+            // A slice wipe (one volatile pass). `Vec::zeroize` would also wipe the capacity byte by
+            // byte, about 9 us here [measured, sign/README.md].
+            wipe::slice(&mut buf);
             let s = Preimage { s0, s1 };
             // On `None` the preimage is wiped when dropped.
             (!off).then_some(s)
@@ -317,7 +321,7 @@ samp_pre_with_fn! {
     /// `f64` lattice point lies farther than $`2^{-10}`$ from an integer (module documentation).
     /// Panics if `t` is not in the key's ring.
     pub fn samp_pre_with;
-    fft, poly_target_fft, ffsampling, poly_lattice_point_fft, ifft
+    fft, poly_target_fft, ffsampling, poly_lattice_point_fft, ifft, NATIVE_ROUND
 }
 
 samp_pre_with_fn! {
@@ -330,7 +334,8 @@ samp_pre_with_fn! {
     crate::fft::poly_target_fft_v3,
     crate::ffsamp::ffsampling_v3,
     crate::fft::poly_lattice_point_fft_v3,
-    crate::fft::ifft_v3
+    crate::fft::ifft_v3,
+    true
 }
 
 /// [`samp_pre_attempt`] compiled for x86-64-v3: the leaf sampler ([`SamplerZ::sample_v3`]),
@@ -379,8 +384,8 @@ pub fn verify(pk: &PublicKey, t: &RqPoly, s: &Preimage, beta_sq: u64) -> bool {
     let hp = pk.h_prepared();
     ntt::mul_prepared_mod_q(params.logn, q, &hp.r1, &hp.r2, &s1q, &mut prod);
     let ok = ntt::add_i32_equals(&mq, &s.s0, &prod, &t.c);
-    s1q.as_mut_slice().zeroize();
-    prod.as_mut_slice().zeroize();
+    wipe::slice(&mut s1q);
+    wipe::slice(&mut prod);
     ok
 }
 

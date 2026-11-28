@@ -82,9 +82,12 @@ The library is **not constant time**. SampPre keeps fn-dsa's isochronous structu
 cheap: fixed-length table scans, and a Bernoulli test scaled by `σ_min / σ'`, whose acceptance
 rate does not depend on `σ'` or on the centre (0.634 at the PCS set's base width, 0.585 at
 fn-dsa's). The following run in variable time:
-- native `f64` arithmetic, on some CPUs;
-- the rejection loops, and the base draw's rare fallback (probability 2^-58.1 per draw);
-- key generation: the binary-search CDT, the candidate loop and the big-integer NTRUSolve.
+- native `f64` arithmetic, on some CPUs, for example on subnormal operands, which the sampler's
+  values are not shown to avoid.
+- the rejection loops, and the base draw's rare fallback (probability 2^-58.1 per draw).
+- key generation: the binary-search CDT, the candidate loop, the big-integer NTRUSolve, and the
+  checks of a candidate and the ffLDL tree, which divide and take square roots in `f64` (as does
+  `ExpandedKey::new`).
 - the Bernoulli test's exact path, which runs in 2 of 256 trials whatever the inputs. Jointly
   with the trial's outcome that event depends on the inputs, as the second byte of the lazy
   comparison already does.
@@ -99,6 +102,23 @@ documentation, `scan_top`). `tools/sampler_branches.py`, which CI runs on x86-64
 with both toolchains, fails if the optimized code branches on a comparison with the table's
 entries. It reads LLVM's IR, not the machine code.
 
+Up to 0.1.3, SampPre had two more leaks of this kind, on values that depend on the key and the
+samples.
+- On x86-64 without SSE4.1, `f64::floor` (the integer part of every ffSampling centre) and
+  `f64::round_ties_even` (the rounding of the lattice point) compile to calls of the C library's
+  `floor` and `rint`, whose time depends on the library: a portable implementation branches on
+  the exponent of the value. Both now go through conversions to an integer and back, as fn-dsa's
+  portable code does, with the same values (tests `floor_i64_equals_floor` and
+  `rint_equals_round_ties_even`). On aarch64, and in the x86-64-v3 copy of SampPre, rounding is
+  one instruction. `tools/sampler_branches.py` also reads the x86-64 machine code and fails if
+  SampPre's functions call the library's floor or rounding functions.
+- The first-byte shortcut of the Bernoulli test skipped its estimate by a branch when the
+  trial's exponent `s` is 8 or more (about once in a thousand trials at `σ' = σ_min`). The
+  estimate is now computed for every trial and masked. On x86-64, x86-64-v3 and aarch64,
+  rustc 1.100.0 compiles the mask to a comparison and a logical AND (`cmpltsd` and `andpd`,
+  `fcmp` and `fcsel`), where a clamp `min(s, 8)` compiled to a branch (checked by reading the
+  machine code, which no test repeats).
+
 The `simd` feature (off by default) adds the crate's only `unsafe` code, in one module
 (`src/simd`): SIMD kernels chosen at run time, each with the same results as the portable code
 it replaces, which the tests compare. Like that code, the kernels do not branch on data and
@@ -109,15 +129,20 @@ process from the processor's features. `samp_pre_batch` squeezes the first block
 streams of several calls together and keeps them until the calls read them, then wipes them
 with the PRNG. How many blocks it squeezes depends only on the parameter set.
 
-The ring arithmetic uses masks; `inverse` reveals only whether an element is a unit.
+The ring arithmetic uses masks, and `RqPoly::from_i64`, `from_i32` and `from_i16` reduce
+modulo `q` by a Barrett reduction with masks, not by a division, whose time depends on its
+operands on many processors. `inverse` reveals only whether an element is a unit.
 `PreparedRqPoly::mul_ternary` also reveals whether its operand is ternary, because it takes a
 faster path then.
 
 ## Wiping
 
 Secret keys, expanded keys, PRNG states, preimages and the scratch buffers that hold the trapdoor
-are wiped on drop (`zeroize`). The exception is NTRUSolve's big integers: `num-bigint` cannot
-wipe its buffers.
+are wiped on drop, and so are the Keccak states and seeds of `samp_pre_batch` and the
+polynomials that `SecretKey::from_parts` refuses. NTRUSolve's intermediates are not wiped: `num-bigint` cannot wipe its buffers, and the crate's
+own limb buffers (`keygen::flat::Flat`) and the `f64` buffers of its Babai reduction are left as
+well, since wiping them would cost about 5 % of key generation and still leave the big integers.
+Copies on the stack, which no type owns, are not wiped either.
 
 ## Input validation
 

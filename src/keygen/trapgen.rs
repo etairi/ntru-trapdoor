@@ -14,12 +14,13 @@
 //!    [`Params::check_leaf_window`], which [`crate::trapgen`] requires, this check can only fire
 //!    through `f64` rounding at the window's boundary.
 
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroize;
 
 use super::gs::{ortho_sq_norm, passes_norm_fg, passes_norm_ortho, sq_norm_fg};
 use super::{KeygenReject, KeygenStats, gauss, solve};
 use crate::prng::Shake256Prng;
 use crate::ring::ntt;
+use crate::wipe::Secret;
 use crate::{Error, ExpandedKey, Params, PublicKey, RqPoly, SecretKey};
 
 /// Domain separator of the key-generation stream (design.md §5.1).
@@ -64,8 +65,8 @@ pub(crate) fn trapgen_full(
     params.check_leaf_window()?;
     let n = params.n();
     let mut prng = keygen_prng(params, seed);
-    let mut f = Zeroizing::new(vec![0i16; n]);
-    let mut g = Zeroizing::new(vec![0i16; n]);
+    let mut f = Secret::new(vec![0i16; n]);
+    let mut g = Secret::new(vec![0i16; n]);
     let mut stats = KeygenStats::default();
     for _ in 0..params.keygen_max_attempts {
         stats.candidates += 1;
@@ -126,19 +127,19 @@ fn from_fg_checked(
     }
     // 4. f invertible modulo q; h = g / f.
     let h = {
-        let fq = Zeroizing::new(RqPoly::from_i16(params, f).map_err(|_| KeygenReject::Input)?);
+        let fq = Secret::new(RqPoly::from_i16(params, f).map_err(|_| KeygenReject::Input)?);
         let Some(finv) = fq.inverse() else {
             return Err(KeygenReject::NotInvertible);
         };
-        let finv = Zeroizing::new(finv);
-        let gq = Zeroizing::new(RqPoly::from_i16(params, g).map_err(|_| KeygenReject::Input)?);
+        let finv = Secret::new(finv);
+        let gq = Secret::new(RqPoly::from_i16(params, g).map_err(|_| KeygenReject::Input)?);
         gq.mul(&finv)
     };
     // 5. NTRUSolve.
     let Some((big_f, big_g)) = solve::ntru_solve(params.q, f, g) else {
         return Err(KeygenReject::Solve);
     };
-    let (mut big_f, mut big_g) = (Zeroizing::new(big_f), Zeroizing::new(big_g));
+    let (mut big_f, mut big_g) = (Secret::new(big_f), Secret::new(big_g));
     // 6. Widths of F and G (at most 16 bits, so they fit i16), then the exact NTRU equation.
     if !fits_width(&big_f, params.sk_big_fg_bits) || !fits_width(&big_g, params.sk_big_fg_bits) {
         return Err(KeygenReject::Size);
@@ -155,8 +156,10 @@ fn from_fg_checked(
         big_g: to16(&big_g),
         validated: false,
     };
-    big_f.zeroize();
-    big_g.zeroize();
+    if crate::wipe::ENABLED {
+        big_f.zeroize();
+        big_g.zeroize();
+    }
     if !ntt::ntru_equation_holds(params.logn, params.q, &sk.f, &sk.g, &sk.big_f, &sk.big_g) {
         return Err(KeygenReject::Solve);
     }
@@ -174,9 +177,9 @@ fn from_fg_checked(
 /// [`SecretKey::public_key`].
 pub(crate) fn public_key(sk: &SecretKey) -> Result<PublicKey, Error> {
     let params = &sk.params;
-    let fq = Zeroizing::new(RqPoly::from_i16(params, &sk.f)?);
-    let finv = Zeroizing::new(fq.inverse().ok_or(Error::InvalidKey)?);
-    let gq = Zeroizing::new(RqPoly::from_i16(params, &sk.g)?);
+    let fq = Secret::new(RqPoly::from_i16(params, &sk.f)?);
+    let finv = Secret::new(fq.inverse().ok_or(Error::InvalidKey)?);
+    let gq = Secret::new(RqPoly::from_i16(params, &sk.g)?);
     Ok(PublicKey::from_valid(params, gq.mul(&finv)))
 }
 
@@ -199,7 +202,7 @@ pub(crate) fn validate(sk: &SecretKey) -> Result<(), Error> {
     if !ntt::ntru_equation_holds(p.logn, p.q, &sk.f, &sk.g, &sk.big_f, &sk.big_g) {
         return Err(Error::InvalidKey);
     }
-    let fq = Zeroizing::new(RqPoly::from_i16(p, &sk.f)?);
+    let fq = Secret::new(RqPoly::from_i16(p, &sk.f)?);
     if !fq.is_invertible() {
         return Err(Error::InvalidKey);
     }

@@ -75,13 +75,17 @@
 //!
 //! ## Side channels
 //!
-//! Performance comes first. SampPre keeps fn-dsa's isochronous sampler (fixed-length table
-//! scans, a Bernoulli test scaled by $`\sigma_{\min}/\sigma'`$), but native `f64` arithmetic,
-//! the rejection loops and key generation (binary-search CDT, big-integer NTRUSolve) are
-//! variable time. The ring arithmetic uses masks; the inverse reveals only whether an element is
-//! a unit. [`PreparedRqPoly::mul_ternary`] also reveals whether its operand is ternary. Secret
-//! keys, expanded keys, PRNG states and preimages are wiped on drop; NTRUSolve's big integers
-//! are not (num-bigint cannot wipe its buffers).
+//! SampPre keeps fn-dsa's isochronous sampler (fixed-length table scans, a Bernoulli test scaled
+//! by $`\sigma_{\min}/\sigma'`$), and takes its floors and roundings without library calls and
+//! its Bernoulli estimate without a branch. Native `f64` arithmetic, the rejection loops and key
+//! generation (binary-search CDT, big-integer NTRUSolve, the checks of a candidate in `f64`) are
+//! variable time. The
+//! ring arithmetic uses masks, and the reductions of signed integers modulo $`q`$ divide by
+//! nothing. The inverse reveals only whether an element is a unit. [`PreparedRqPoly::mul_ternary`]
+//! also reveals whether its operand is ternary. Secret keys, expanded keys, PRNG states and
+//! preimages are wiped on drop. NTRUSolve's intermediates are not: num-bigint cannot wipe its
+//! buffers, and the crate's own limb buffers are left as well (docs/security.md).
+
 //!
 //! ## Credits
 //!
@@ -105,6 +109,7 @@ mod keys;
 mod params;
 mod poly;
 pub mod tables;
+mod wipe;
 
 // R_q, FFT, PRNG, sampler, expanded key, SampPre and Verify.
 mod ffsamp;
